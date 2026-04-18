@@ -1856,6 +1856,42 @@ async function loadDeadline() {
     deadlineLoadError = "Could not reach Settings sheet: " + e.message;
   }
 }
+
+function isRegistrationClosed() {
+  if (!deadline) return false;
+  return new Date() > deadline;
+}
+
+function formatDeadline(d) {
+  if (!d) return "Not set";
+  return d.toLocaleString("en-GB", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+// Returns a datetime-local-compatible string in LOCAL time (not UTC)
+function toLocalDatetimeString(d) {
+  if (!d) return "";
+  var pad = function (n) {
+    return String(n).padStart(2, "0");
+  };
+  return (
+    d.getFullYear() +
+    "-" +
+    pad(d.getMonth() + 1) +
+    "-" +
+    pad(d.getDate()) +
+    "T" +
+    pad(d.getHours()) +
+    ":" +
+    pad(d.getMinutes())
+  );
+}
+
 // --- Admin panel ---
 function onHeaderClick() {
   headerClickCount++;
