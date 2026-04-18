@@ -841,7 +841,7 @@
           var banner = document.createElement('div');
           banner.className = 'err-banner';
           banner.style.marginTop = '1rem';
-          banner.textContent = 'Submission failed — please check your connection and try again.';
+          banner.textContent = 'Submission failed: ' + err.message;
           var existing = document.querySelector('.err-banner');
           if (existing) existing.remove();
           var pb = document.querySelector('.btn-primary');
