@@ -202,7 +202,12 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ data: payload })
       });
-      if (!res.ok) throw new Error('API error ' + res.status);
+      if (!res.ok) {
+        var errObj = {};
+        try { errObj = await res.json(); } catch(e) {}
+        if (errObj.error === 'DUPLICATE_PHONE') throw new Error('DUPLICATE_PHONE');
+        throw new Error('API error ' + res.status);
+      }
     }
 
     async function getLiveSeatCount(slotId) {
@@ -787,7 +792,7 @@
       }
       submitting = true;
       var btn = document.querySelector('.btn-primary');
-      if (btn) { btn.disabled = true; btn.textContent = 'Registering\u2026'; }
+      if (btn) { btn.disabled = true; btn.innerHTML = '<svg class="btn-spinner" viewBox="0 0 50 50"><circle cx="25" cy="25" r="20" fill="none" stroke-width="5"></circle></svg> Registering&hellip;'; }
       var seatDecremented = false;
       try {
         var schoolLabel = form.school === 'adam_johns' ? "Adam & John's" : 'Other';
@@ -821,22 +826,56 @@
         render();
       } catch(err) {
         submitting = false;
-        // FIX: Restore seat if it was decremented but sheet write failed
         if (seatDecremented) {
           var slotInfo2 = SLOTS.find(function(s) { return s.id === form.slot; });
           var et2 = (registrationMode === 'main_speaking' && slotInfo2 && slotInfo2.speakingEnabled) ? examType : null;
           restoreOldSeat(poolId(form.slot, et2)).catch(function() {});
         }
         var freshBtn = document.querySelector('.btn-primary');
-        if (freshBtn) { freshBtn.disabled = false; freshBtn.textContent = 'Complete registration'; }
-        var banner = document.createElement('div');
-        banner.className = 'err-banner';
-        banner.style.marginTop = '1rem';
-        banner.textContent = 'Submission failed — please check your connection and try again.';
-        var existing = document.querySelector('.err-banner');
-        if (existing) existing.remove();
-        var pb = document.querySelector('.btn-primary');
-        if (pb) pb.parentNode.insertBefore(banner, pb);
+        if (freshBtn) { freshBtn.disabled = false; freshBtn.innerHTML = 'Complete registration'; }
+        
+        if (err.message === 'DUPLICATE_PHONE') {
+          errors.phone = 'A user with this phone number is already registered.';
+          render();
+        } else {
+          var banner = document.createElement('div');
+          banner.className = 'err-banner';
+          banner.style.marginTop = '1rem';
+          banner.textContent = 'Submission failed — please check your connection and try again.';
+          var existing = document.querySelector('.err-banner');
+          if (existing) existing.remove();
+          var pb = document.querySelector('.btn-primary');
+          if (pb) pb.parentNode.insertBefore(banner, pb);
+        }
+      }
+    }
+
+    async function performCancellationLogic(reg) {
+      if (!reg) return;
+      var et3 = reg.examType || null;
+      var pid3 = poolId(reg.slotId, et3);
+      if (VALID_SLOT_IDS.indexOf(reg.slotId) !== -1) {
+        await restoreOldSeat(pid3);
+      }
+      var cancelledSlotId = reg.slotId;
+
+      var cleanPhone = (reg.phone || '').replace(/\D/g, '');
+      if (cleanPhone.startsWith('998')) {
+        cleanPhone = cleanPhone.substring(3);
+      }
+      var cancelPhone = '998' + cleanPhone;
+
+      if (cleanPhone.length > 3) {
+        try {
+          await fetch(API + '/Phone/' + phonePathSeg(cancelPhone) + '?sheet=Registrations', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' }
+          });
+        } catch(e) { /* deletion failure is non-fatal — seat is already restored */ }
+      }
+
+      if (VALID_SLOT_IDS.indexOf(cancelledSlotId) !== -1) {
+        recalculateSpeakingTimes(cancelledSlotId).catch(function() {});
       }
     }
 
@@ -845,39 +884,17 @@
       var reg = getRegistration();
       if (!reg) return;
 
-      // Disable the cancel button and show progress
       var cancelBtn = document.querySelector('.btn-danger');
-      if (cancelBtn) { cancelBtn.disabled = true; cancelBtn.textContent = 'Cancelling…'; }
+      if (cancelBtn) { cancelBtn.disabled = true; cancelBtn.innerHTML = '<svg class="btn-spinner" viewBox="0 0 50 50"><circle cx="25" cy="25" r="20" fill="none" stroke-width="5"></circle></svg> Cancelling&hellip;'; }
 
       try {
-        var et3 = reg.examType || null;
-        var pid3 = poolId(reg.slotId, et3);
-        if (VALID_SLOT_IDS.indexOf(reg.slotId) !== -1) {
-          await restoreOldSeat(pid3);
-        }
-        var cancelledSlotId = reg.slotId;
-        var cancelledET     = reg.examType || null;
-
-        // Delete the student's row from the Registrations sheet
-        var cancelPhone = '998' + reg.phone.replace(/\D/g, '');
-        try {
-          await fetch(API + '/Phone/' + phonePathSeg(cancelPhone) + '?sheet=Registrations', {
-            method: 'DELETE',
-            headers: { 'Content-Type': 'application/json' }
-          });
-        } catch(e) { /* deletion failure is non-fatal — seat is already restored */ }
-
+        await performCancellationLogic(reg);
         clearRegistration();
         form = { slot: null, name: '', phone: '', school: '' };
         examType = null;
         step = 1;
         render();
-        // Recalculate speaking times for this session so remaining students shift up
-        if (cancelledET && VALID_SLOT_IDS.indexOf(cancelledSlotId) !== -1) {
-          recalculateSpeakingTimes(cancelledSlotId).catch(function() {});
-        }
       } catch(err) {
-        // Seat restore failed — do NOT clear the registration
         if (cancelBtn) { cancelBtn.disabled = false; cancelBtn.textContent = 'Cancel my registration'; }
         alert('Could not release your seat — please check your connection and try again.');
       }
@@ -1306,13 +1323,83 @@
         '</div>';
     }
 
+    var adminStudents = null;
+    var adminStudentsLoading = false;
+    var adminStudentsError = '';
+
+    async function adminLoadStudents() {
+      adminStudentsLoading = true;
+      adminStudentsError = '';
+      renderAdminOverlay();
+      try {
+        var res = await fetch(API + '?sheet=Registrations');
+        if (!res.ok) throw new Error('Failed to load ' + res.status);
+        var data = await res.json();
+        adminStudents = Array.isArray(data) ? data.slice().reverse() : []; // show newest first
+      } catch (e) {
+        adminStudentsError = e.message;
+      }
+      adminStudentsLoading = false;
+      renderAdminOverlay();
+    }
+
+    async function adminCancelStudent(ph, sid, et) {
+      if (!confirm('Cancel this student? This will instantly free up their seat and recalculate queues.')) return;
+      var obj = { phone: ph, slotId: sid, examType: et };
+      adminStudentsLoading = true;
+      renderAdminOverlay();
+      try {
+        await performCancellationLogic(obj);
+        await adminLoadStudents(); // refresh roster instantly
+      } catch (e) {
+        adminStudentsError = 'Cancellation failed: ' + e.message;
+        adminStudentsLoading = false;
+        renderAdminOverlay();
+      }
+    }
+
     function renderAdminPanelHTML() {
       var tabs =
         '<div class="admin-tabs">' +
         '<button class="admin-tab' + (adminActiveTab === 'deadline' ? ' active' : '') + '" onclick="adminSwitchTab(\'deadline\')">Deadline</button>' +
         '<button class="admin-tab' + (adminActiveTab === 'sessions' ? ' active' : '') + '" onclick="adminSwitchTab(\'sessions\')">Sessions</button>' +
         '<button class="admin-tab' + (adminActiveTab === 'mode' ? ' active' : '') + '" onclick="adminSwitchTab(\'mode\')">Mode</button>' +
+        '<button class="admin-tab' + (adminActiveTab === 'students' ? ' active' : '') + '" onclick="adminSwitchTab(\'students\')">Students</button>' +
         '</div>';
+
+      if (adminActiveTab === 'students') {
+        var html = '<div class="admin-panel" style="max-width:600px"><div class="admin-title">Students Roster</div>' + tabs;
+        
+        if (adminStudentsLoading) {
+          html += '<div class="loading-screen" style="padding:1rem 0"><div class="loading-dots"><div class="loading-dot"></div><div class="loading-dot"></div><div class="loading-dot"></div></div><div class="loading-text">Loading roster...</div></div>';
+        } else if (adminStudentsError) {
+          html += '<div class="err-banner">' + esc(adminStudentsError) + '</div>';
+        } else if (adminStudents && adminStudents.length > 0) {
+          var rosterParams = adminStudents.map(function(st) {
+             var ph = st.Phone || st.phone || '';
+             var nm = st.Name || st.name || '';
+             var slot = st.Session || st.session || '';
+             
+             var slotInfo = SLOTS.find(function(s) { return sheetTime(s.label) === slot || s.label === slot.replace(/ \(est\.\)$/, ''); });
+             var sid = slotInfo ? slotInfo.id : '';
+             var et = st.ExamType || st.examtype || null;
+             if (et && et.toLowerCase() === 'speaking') et = 'speaking';
+             else if (et && et.toLowerCase() === 'main') et = 'main';
+
+             return '<div class="session-row" style="padding:12px;justify-content:space-between;align-items:center">' +
+               '<div><div style="font-size:14px;font-weight:600;color:#fff;margin-bottom:4px">' + esc(nm) + '</div>' +
+               '<div style="font-size:12px;color:var(--muted)">' + esc(ph) + ' &bull; ' + esc(slot) + (et?' &bull; ' + et:'') + '</div></div>' +
+               '<button class="session-del" style="border:1px solid var(--red-border);color:var(--red);border-radius:4px;padding:4px 8px;font-size:11px;width:auto;height:auto" onclick="adminCancelStudent(\'' + scr(ph) + '\',\'' + scr(sid) + '\',\'' + scr(et||'') + '\')">Cancel</button>' +
+               '</div>';
+          }).join('');
+          html += '<div style="max-height:360px;overflow-y:auto;padding-right:4px">' + rosterParams + '</div>';
+        } else {
+          html += '<div style="text-align:center;color:var(--muted);font-size:13px;padding:2rem 0">No students registered yet.</div>';
+        }
+        
+        html += '<button class="btn-secondary" style="margin-top:16px" onclick="closeAdmin()">Close</button></div>';
+        return html;
+      }
 
       if (adminActiveTab === 'deadline') {
         var deadlineStr = deadline ? toLocalDatetimeString(deadline) : '';
@@ -1409,6 +1496,7 @@
       if (tab === 'sessions') adminSessionDraft = adminSessionDraft || SLOTS.map(function(s) {
         return { id: s.id, label: s.label, maxSeats: getMaxSeats(s.id), period: s.period || '', speakingEnabled: !!s.speakingEnabled, teachers: s.teachers || 1 };
       });
+      if (tab === 'students') adminLoadStudents();
       renderAdminOverlay();
     }
 

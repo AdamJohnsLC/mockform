@@ -1,7 +1,7 @@
 // Cloudflare Worker — Google Apps Script proxy + static assets
 
 // Replace this URL once you deploy your Google Apps Script!
-const APP_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyyf-HT8phmnGcdDjIJXo6-nxiemox1IanlBTqB806paa5610tSrD2Z55cDfZYGdh8s/exec';
+const APP_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxbeKZKTqZzMacAtntjE1zlgO3iJXAcnIYdjghNm0FqPg8n4a1iXS3P_AuiNWN5hT3g/exec';
 
 const ALLOWED_PATH = /^(\/?|\/search|\/Slot\/[^/?]+|\/Phone\/[^/?]+|\/Key\/[^/?]+)(\?.*)?$/;
 const EXPECTED_ADMIN_HASH = '4e00966f7d1e666e33b9f63bfad60646e023890a664d10a2e9df11331c46d976';
@@ -58,7 +58,20 @@ async function handleApi(request, env, url) {
     }
   }
 
-  // Allow passing the URL securely via Cloudflare variables, fallback to hardcoded
+  // Extract body dynamically BEFORE trying to use it
+  let parsedBody = null;
+  if (['POST', 'PUT', 'PATCH'].includes(request.method)) {
+    try { parsedBody = await request.clone().json(); } catch (e) { }
+  }
+
+  // ------- CLOUDFLARE KV INTERCEPTION -------
+  // If the request targets Seats or Settings, we answer it instantly from the Edge Database!
+  if (qsParams.sheet === 'Seats' || qsParams.sheet === 'Settings') {
+    return handleKV(request, env, subPath, qsParams, parsedBody);
+  }
+
+  // ------- GOOGLE APPS SCRIPT TUNNEL -------
+  // Route everything else (like Registrations) to Google Forms silently in background.
   const targetUrl = env.GAS_URL || APP_SCRIPT_URL;
   if (!targetUrl || targetUrl.includes('PASTE_YOUR_WEB')) {
     return new Response(JSON.stringify({ error: 'Google Apps Script URL not configured in worker.js' }), {
@@ -67,13 +80,6 @@ async function handleApi(request, env, url) {
     });
   }
 
-  // Extract body dynamically if it exists
-  let parsedBody = null;
-  if (['POST', 'PUT', 'PATCH'].includes(request.method)) {
-    try { parsedBody = await request.clone().json(); } catch (e) { }
-  }
-
-  // Package the exact structure of the request to be TUNNELED to Google
   const tunnelPayload = {
     method: request.method,
     sheet: qsParams.sheet || '',
@@ -83,24 +89,18 @@ async function handleApi(request, env, url) {
   };
 
   try {
-    // Send EVERYTHING as a POST request so Apps Script can natively parse req.body
     const upstream = await fetch(targetUrl, {
       method: 'POST',
       body: JSON.stringify(tunnelPayload),
-      headers: {
-        'Content-Type': 'text/plain' // Must use text/plain for CORS with Apps Script
-      }
+      headers: { 'Content-Type': 'text/plain' }
     });
 
-    // Cloudflare natively handles the 302 Redirect sequence from Google automatically
+    // Natively handle Google redirects
     const body = await upstream.text();
 
     return new Response(body, {
       status: upstream.status,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      }
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
     });
 
   } catch (err) {
@@ -109,4 +109,86 @@ async function handleApi(request, env, url) {
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
     });
   }
+}
+
+// ----------------------------------------------------
+// KV DATABASE HANDLER
+// Translates SheetDB-style logic natively into KV JSON
+// ----------------------------------------------------
+async function handleKV(request, env, subPath, qsParams, parsedBody) {
+  const db = env.MOCK_DB;
+  if (!db) {
+    return new Response(JSON.stringify({ error: 'MOCK_DB KV namespace not bound' }), { status: 500 });
+  }
+
+  const sheet = qsParams.sheet;
+  const method = request.method;
+  const payload = parsedBody && parsedBody.data ? parsedBody.data : parsedBody;
+
+  const corsHeaders = {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*'
+  };
+
+  // 1. READ STATE
+  let dataObj = await db.get(sheet, 'json');
+  if (!dataObj) dataObj = {};
+
+  // 2. READ OPERATIONS (GET)
+  if (method === 'GET') {
+    if (sheet === 'Seats') {
+      if (subPath.startsWith('/search')) {
+        let sid = qsParams.Slot;
+        if (sid && dataObj[sid] !== undefined) {
+          return new Response(JSON.stringify([{ Slot: sid, Remaining: dataObj[sid] }]), { status: 200, headers: corsHeaders });
+        }
+      } else {
+        // Return full array
+        let arr = Object.keys(dataObj).map(k => ({ Slot: k, Remaining: dataObj[k] }));
+        return new Response(JSON.stringify(arr), { status: 200, headers: corsHeaders });
+      }
+    }
+    else if (sheet === 'Settings' && subPath.startsWith('/search')) {
+      let k = qsParams.Key;
+      if (k && dataObj[k] !== undefined) {
+        return new Response(JSON.stringify([{ Value: dataObj[k] }]), { status: 200, headers: corsHeaders });
+      }
+    }
+    // Fallback empty read
+    return new Response(JSON.stringify([]), { status: 200, headers: corsHeaders });
+  }
+
+  // 3. WRITE OPERATIONS (POST, PATCH, DELETE)
+  if (sheet === 'Seats') {
+    if (method === 'POST') {
+      let k = payload.Slot;
+      if (k) dataObj[k] = Number(payload.Remaining || 0);
+    }
+    else if (method === 'PATCH' || method === 'DELETE') {
+      let parts = subPath.split('/').filter(Boolean); // ['Slot', 'slot_0800']
+      if (parts.length === 2 && parts[0] === 'Slot') {
+        let k = decodeURIComponent(parts[1]);
+        if (method === 'DELETE') {
+          delete dataObj[k];
+        } else if (payload && payload.Remaining !== undefined) {
+          dataObj[k] = Number(payload.Remaining);
+        }
+      }
+    }
+  }
+  else if (sheet === 'Settings') {
+    if (method === 'PATCH') {
+      let parts = subPath.split('/').filter(Boolean); // ['Key', 'deadline']
+      if (parts.length === 2 && parts[0] === 'Key') {
+        let k = decodeURIComponent(parts[1]);
+        if (payload && payload.Value !== undefined) {
+          dataObj[k] = payload.Value;
+        }
+      }
+    }
+  }
+
+  // 4. WRITE STATE BACK TO EDGE
+  await db.put(sheet, JSON.stringify(dataObj));
+  return new Response(JSON.stringify({ updated: 1, deleted: 1 }), { status: 200, headers: corsHeaders });
 }
