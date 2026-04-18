@@ -37,7 +37,7 @@ export default {
 };
 
 async function handleApi(request, env, url, ctx) {
-  const subPath = url.pathname.slice("/api".length); // e.g. '' or '/search'
+  const subPath = url.pathname.slice("/api".length);
   const qsParams = Object.fromEntries(url.searchParams.entries());
 
   if (!ALLOWED_PATH.test(subPath)) {
@@ -53,7 +53,6 @@ async function handleApi(request, env, url, ctx) {
     );
   }
 
-  // Admin-only security check locally
   const isSettingsMod = subPath.startsWith("/Key/") && request.method !== "GET";
   const isSeatsAdd = request.method === "POST" && qsParams.sheet === "Seats";
   const isSeatsDel = request.method === "DELETE" && qsParams.sheet === "Seats";
@@ -74,127 +73,19 @@ async function handleApi(request, env, url, ctx) {
     }
   }
 
-  // Extract body dynamically BEFORE trying to use it
   let parsedBody = null;
   if (["POST", "PUT", "PATCH"].includes(request.method)) {
-    // --- SUB-10MS LATENCY PATCH (Registrations duplicate check via KV) ---
-    if (qsParams.sheet === "Registrations" && env.MOCK_DB) {
-      if (request.method === "POST") {
-        let phonesConfig = await env.MOCK_DB.get("__PHONES__", "json");
-        if (!Array.isArray(phonesConfig)) phonesConfig = [];
-        const incomingPhone =
-          parsedBody && parsedBody.data ? parsedBody.data.Phone : undefined;
-
-        if (incomingPhone) {
-          if (phonesConfig.includes(String(incomingPhone))) {
-            return new Response(JSON.stringify({ error: "DUPLICATE_PHONE" }), {
-              status: 409,
-              headers: {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-              },
-            });
-          }
-          phonesConfig.push(String(incomingPhone));
-          await env.MOCK_DB.put("__PHONES__", JSON.stringify(phonesConfig));
-        }
-
-        ctx.waitUntil(
-          fetch(targetUrl, {
-            method: "POST",
-            body: JSON.stringify(tunnelPayload),
-            headers: { "Content-Type": "text/plain" },
-          }),
-        );
-        return new Response(JSON.stringify({ created: 1 }), {
-          status: 201,
-          headers: {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
-          },
-        });
-      }
-
-      if (request.method === "DELETE" && subPath.startsWith("/Phone/")) {
-        let parts = subPath.split("/").filter(Boolean);
-        if (parts.length === 2) {
-          let phoneToDel = decodeURIComponent(parts[1]);
-          let phonesConfig = await env.MOCK_DB.get("__PHONES__", "json");
-          if (Array.isArray(phonesConfig)) {
-            phonesConfig = phonesConfig.filter(
-              (p) => String(p) !== String(phoneToDel),
-            );
-            await env.MOCK_DB.put("__PHONES__", JSON.stringify(phonesConfig));
-          }
-        }
-        ctx.waitUntil(
-          fetch(targetUrl, {
-            method: "POST",
-            body: JSON.stringify(tunnelPayload),
-            headers: { "Content-Type": "text/plain" },
-          }),
-        );
-        return new Response(JSON.stringify({ deleted: 1 }), {
-          status: 200,
-          headers: {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
-          },
-        });
-      }
-
-      if (request.method === "GET") {
-        try {
-          const upstream = await fetch(targetUrl, {
-            method: "POST",
-            body: JSON.stringify(tunnelPayload),
-            headers: { "Content-Type": "text/plain" },
-          });
-          const bodyText = await upstream.text();
-          try {
-            const rows = JSON.parse(bodyText);
-            if (Array.isArray(rows)) {
-              const phones = rows.map((r) => String(r.Phone)).filter(Boolean);
-              ctx.waitUntil(
-                env.MOCK_DB.put("__PHONES__", JSON.stringify(phones)),
-              );
-            }
-          } catch (e) {}
-          return new Response(bodyText, {
-            status: upstream.status,
-            headers: {
-              "Content-Type": "application/json",
-              "Access-Control-Allow-Origin": "*",
-            },
-          });
-        } catch (err) {
-          return new Response(
-            JSON.stringify({ error: "Apps Script GET failed: " + err.message }),
-            {
-              status: 502,
-              headers: {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-              },
-            },
-          );
-        }
-      }
-    }
-
     try {
       parsedBody = await request.clone().json();
     } catch (e) {}
   }
 
-  // ------- CLOUDFLARE KV INTERCEPTION -------
-  // If the request targets Seats or Settings, we answer it instantly from the Edge Database!
+  // -- KV Edge --
   if (qsParams.sheet === "Seats" || qsParams.sheet === "Settings") {
     return handleKV(request, env, subPath, qsParams, parsedBody);
   }
 
-  // ------- GOOGLE APPS SCRIPT TUNNEL -------
-  // Route everything else (like Registrations) to Google Forms silently in background.
+  // -- GAS Tunnel setup --
   const targetUrl = env.GAS_URL || APP_SCRIPT_URL;
   if (!targetUrl || targetUrl.includes("PASTE_YOUR_WEB")) {
     return new Response(
@@ -219,16 +110,119 @@ async function handleApi(request, env, url, ctx) {
     body: parsedBody,
   };
 
+  // -- FAST TRACK FOR REGISTRATIONS --
+  if (qsParams.sheet === "Registrations" && env.MOCK_DB) {
+    if (request.method === "POST") {
+      let phonesConfig = await env.MOCK_DB.get("__PHONES__", "json");
+      if (!Array.isArray(phonesConfig)) phonesConfig = [];
+      const incomingPhone =
+        parsedBody && parsedBody.data ? parsedBody.data.Phone : undefined;
+
+      if (incomingPhone) {
+        if (phonesConfig.includes(String(incomingPhone))) {
+          return new Response(JSON.stringify({ error: "DUPLICATE_PHONE" }), {
+            status: 409,
+            headers: {
+              "Content-Type": "application/json",
+              "Access-Control-Allow-Origin": "*",
+            },
+          });
+        }
+        phonesConfig.push(String(incomingPhone));
+        await env.MOCK_DB.put("__PHONES__", JSON.stringify(phonesConfig));
+      }
+
+      ctx.waitUntil(
+        fetch(targetUrl, {
+          method: "POST",
+          body: JSON.stringify(tunnelPayload),
+          headers: { "Content-Type": "text/plain" },
+        }),
+      );
+      return new Response(JSON.stringify({ created: 1 }), {
+        status: 201,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+
+    if (request.method === "DELETE" && subPath.startsWith("/Phone/")) {
+      let parts = subPath.split("/").filter(Boolean);
+      if (parts.length === 2) {
+        let phoneToDel = decodeURIComponent(parts[1]);
+        let phonesConfig = await env.MOCK_DB.get("__PHONES__", "json");
+        if (Array.isArray(phonesConfig)) {
+          phonesConfig = phonesConfig.filter(
+            (p) => String(p) !== String(phoneToDel),
+          );
+          await env.MOCK_DB.put("__PHONES__", JSON.stringify(phonesConfig));
+        }
+      }
+      ctx.waitUntil(
+        fetch(targetUrl, {
+          method: "POST",
+          body: JSON.stringify(tunnelPayload),
+          headers: { "Content-Type": "text/plain" },
+        }),
+      );
+      return new Response(JSON.stringify({ deleted: 1 }), {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+
+    if (request.method === "GET") {
+      try {
+        const upstream = await fetch(targetUrl, {
+          method: "POST",
+          body: JSON.stringify(tunnelPayload),
+          headers: { "Content-Type": "text/plain" },
+        });
+        const bodyText = await upstream.text();
+        try {
+          const rows = JSON.parse(bodyText);
+          if (Array.isArray(rows)) {
+            const phones = rows.map((r) => String(r.Phone)).filter(Boolean);
+            ctx.waitUntil(
+              env.MOCK_DB.put("__PHONES__", JSON.stringify(phones)),
+            );
+          }
+        } catch (e) {}
+        return new Response(bodyText, {
+          status: upstream.status,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        });
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ error: "Apps Script GET failed: " + err.message }),
+          {
+            status: 502,
+            headers: {
+              "Content-Type": "application/json",
+              "Access-Control-Allow-Origin": "*",
+            },
+          },
+        );
+      }
+    }
+  }
+
+  // -- Fallback --
   try {
     const upstream = await fetch(targetUrl, {
       method: "POST",
       body: JSON.stringify(tunnelPayload),
       headers: { "Content-Type": "text/plain" },
     });
-
-    // Natively handle Google redirects
     const body = await upstream.text();
-
     return new Response(body, {
       status: upstream.status,
       headers: {
