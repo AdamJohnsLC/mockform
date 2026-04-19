@@ -860,9 +860,16 @@ function renderManage() {
     esc(reg.school) +
     "</span></div>" +
     "</div>" +
-    '<button class="btn-green" onclick="goChangeSlot()" ' +
-    (submitting ? "disabled" : "") +
-    ">Change my session</button>" +
+    (isRegistrationClosed()
+      ? '<div class="deadline-warning">' +
+        '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>' +
+        '<span>Registration deadline has passed &mdash; session changes are no longer available.</span>' +
+        '</div>' +
+        '<button class="btn-green" disabled style="opacity:0.45;cursor:not-allowed">Change my session</button>' +
+        ''
+      : '<button class="btn-green" onclick="goChangeSlot()" ' +
+        (submitting ? "disabled" : "") +
+        ">Change my session</button>") +
     (reg.examType && isMSSession(reg.slotId)
       ? '<button class="btn-secondary" onclick="goChangeExamType()" ' +
         (submitting ? "disabled" : "") +
@@ -1202,7 +1209,7 @@ function goBack() {
 }
 function goChangeSlot() {
   if (isRegistrationClosed()) {
-    alert("Registration is closed — you can no longer change your session.");
+    // Button is already disabled; this is a safety net
     return;
   }
   newSlotChoice = null;
