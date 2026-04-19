@@ -478,6 +478,13 @@ function esc(s) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
+// Escape for inline JS strings inside onclick attributes
+function scr(s) {
+  return String(s)
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/"/g, '\\"');
+}
 // Append " (est.)" so Google Sheets treats the value as plain text, not a time decimal
 function sheetTime(t) {
   return t ? t + " (est.)" : "";
