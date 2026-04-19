@@ -64,6 +64,15 @@ var HEADER_CLICK_RESET_MS = 1500; // ms window for 5-click trigger
 var COUNTDOWN_THRESHOLD_MS = 24 * 60 * 60 * 1000; // show countdown within 24h
 var MS_PER_HOUR = 3600000;
 var MS_PER_MINUTE = 60000;
+var adminStudentFilter = ""; // search filter for students tab
+var adminStudentsLoadedAt = 0; // timestamp of last students load
+
+// Restore admin session from sessionStorage
+try {
+  if (sessionStorage.getItem("adminAuth") === "1") {
+    adminAuthenticated = true;
+  }
+} catch (e) {}
 
 // --- Main+Speaking mode ---
 var SPEAKING_SUFFIX = "_speaking";
@@ -831,6 +840,7 @@ function renderManage() {
   }
   return (
     '<div class="success-screen">' +
+    '<div class="confetti-wrap"><div class="confetti-dot"></div><div class="confetti-dot"></div><div class="confetti-dot"></div><div class="confetti-dot"></div><div class="confetti-dot"></div><div class="confetti-dot"></div><div class="confetti-dot"></div><div class="confetti-dot"></div></div>' +
     '<div class="success-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#3dbd8b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>' +
     '<div class="manage-title">You&#39;re registered!</div>' +
     '<div class="manage-sub">Your spot is confirmed. Arrive 10 minutes early with your student ID.</div>' +
@@ -1016,7 +1026,54 @@ function render() {
     step = 1;
     el.innerHTML = renderStep1();
   }
+  // Admin FAB: show on non-admin screens when authenticated
+  updateAdminFab();
 }
+
+function updateAdminFab() {
+  var existing = document.getElementById("admin-fab");
+  if (adminAuthenticated && step !== 99) {
+    if (!existing) {
+      var fab = document.createElement("button");
+      fab.id = "admin-fab";
+      fab.className = "admin-fab";
+      fab.innerHTML = '&#9881; Admin';
+      fab.onclick = function () { step = 99; render(); };
+      document.body.appendChild(fab);
+    }
+  } else if (existing) {
+    existing.remove();
+  }
+}
+
+// --- Toast Notification System ---
+function showToast(message, type) {
+  type = type || "info";
+  var container = document.getElementById("toast-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "toast-container";
+    container.className = "toast-container";
+    document.body.appendChild(container);
+  }
+  var toast = document.createElement("div");
+  toast.className = "toast " + type;
+  var icon = type === "success" ? "&#10003;" : type === "error" ? "&#10007;" : "&#8505;";
+  toast.innerHTML = '<span>' + icon + '</span><span>' + message + '</span>';
+  container.appendChild(toast);
+  setTimeout(function () {
+    toast.classList.add("toast-out");
+    setTimeout(function () { toast.remove(); }, 300);
+  }, 3000);
+}
+
+// --- Escape key handler ---
+document.addEventListener("keydown", function (e) {
+  if (e.key === "Escape" && step === 99) {
+    step = 1;
+    render();
+  }
+});
 
 // --- Actions ---
 function selectSlot(id) {
@@ -1954,6 +2011,7 @@ async function adminLogin() {
     adminFailedAttempts = 0;
     adminLockedUntil = 0;
     adminStatus = "";
+    try { sessionStorage.setItem("adminAuth", "1"); } catch (e) {}
     render();
   } else {
     adminFailedAttempts++;
@@ -1984,10 +2042,20 @@ function closeAdmin() {
     adminSaveTimer = null;
   }
   adminSessionDraft = null;
-  adminAuthenticated = false;
+  // Keep adminAuthenticated = true so user can re-enter via FAB
   adminStatus = "";
   step = 1;
   render();
+}
+
+function adminLogout() {
+  adminAuthenticated = false;
+  try { sessionStorage.removeItem("adminAuth"); } catch (e) {}
+  adminStatus = "";
+  adminSessionDraft = null;
+  step = 1;
+  render();
+  showToast("Logged out of admin", "info");
 }
 
 function renderAdminLoginHTML() {
@@ -2001,6 +2069,7 @@ function renderAdminLoginHTML() {
     (adminStatus || "") +
     "</div>" +
     '<button class="btn-secondary" onclick="closeAdmin()">Cancel</button>' +
+    '<button class="btn-secondary" style="margin-top:4px;color:var(--red);border-color:var(--red-border)" onclick="adminLogout()">Log out</button>' +
     "</div>"
   );
 }
@@ -2009,7 +2078,11 @@ var adminStudents = null;
 var adminStudentsLoading = false;
 var adminStudentsError = "";
 
-async function adminLoadStudents() {
+async function adminLoadStudents(force) {
+  // Smart refresh: skip if data is fresh (<30s) unless forced
+  if (!force && adminStudents !== null && (Date.now() - adminStudentsLoadedAt) < 30000) {
+    return;
+  }
   adminStudentsLoading = true;
   adminStudentsError = "";
   render();
@@ -2018,6 +2091,7 @@ async function adminLoadStudents() {
     if (!res.ok) throw new Error("Failed to load " + res.status);
     var data = await res.json();
     adminStudents = Array.isArray(data) ? data.slice().reverse() : []; // show newest first
+    adminStudentsLoadedAt = Date.now();
   } catch (e) {
     adminStudentsError = e.message;
   }
@@ -2037,7 +2111,8 @@ async function adminCancelStudent(ph, sid, et) {
   render();
   try {
     await performCancellationLogic(obj);
-    await adminLoadStudents(); // refresh roster instantly
+    showToast("Student cancelled successfully", "success");
+    await adminLoadStudents(true); // refresh roster instantly
   } catch (e) {
     adminStudentsError = "Cancellation failed: " + e.message;
     adminStudentsLoading = false;
@@ -2046,6 +2121,9 @@ async function adminCancelStudent(ph, sid, et) {
 }
 
 function renderAdminPanelHTML() {
+  var studentsBadge = (adminStudents && adminStudents.length > 0)
+    ? ' <span class="admin-tab-badge">' + adminStudents.length + '</span>'
+    : '';
   var tabs =
     '<div class="admin-tabs">' +
     '<button class="admin-tab' +
@@ -2059,7 +2137,7 @@ function renderAdminPanelHTML() {
     '" onclick="adminSwitchTab(\'mode\')">Mode</button>' +
     '<button class="admin-tab' +
     (adminActiveTab === "students" ? " active" : "") +
-    '" onclick="adminSwitchTab(\'students\')">Students</button>' +
+    '" onclick="adminSwitchTab(\'students\')">Students' + studentsBadge + '</button>' +
     "</div>";
 
   if (adminActiveTab === "students") {
@@ -2067,13 +2145,33 @@ function renderAdminPanelHTML() {
       '<div class="admin-panel" style="max-width:600px"><div class="admin-title">Students Roster</div>' +
       tabs;
 
+    // Search input
+    html += '<div class="student-search-wrap">' +
+      '<svg class="student-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>' +
+      '<input class="student-search" type="text" placeholder="Search by name or phone..." value="' + esc(adminStudentFilter) + '" oninput="adminStudentFilter=this.value;render()" />' +
+      '</div>';
+
     if (adminStudentsLoading) {
       html +=
-        '<div class="loading-screen" style="padding:1rem 0"><div class="loading-dots"><div class="loading-dot"></div><div class="loading-dot"></div><div class="loading-dot"></div></div><div class="loading-text">Loading roster...</div></div>';
+        '<div class="skeleton-row"><div><div class="skeleton-bar sk-name"></div><div class="skeleton-bar sk-meta"></div></div><div class="skeleton-bar sk-btn"></div></div>' +
+        '<div class="skeleton-row"><div><div class="skeleton-bar sk-name"></div><div class="skeleton-bar sk-meta"></div></div><div class="skeleton-bar sk-btn"></div></div>' +
+        '<div class="skeleton-row"><div><div class="skeleton-bar sk-name"></div><div class="skeleton-bar sk-meta"></div></div><div class="skeleton-bar sk-btn"></div></div>';
     } else if (adminStudentsError) {
       html += '<div class="err-banner">' + esc(adminStudentsError) + "</div>";
     } else if (adminStudents && adminStudents.length > 0) {
-      var rosterParams = adminStudents
+      var filteredStudents = adminStudents;
+      if (adminStudentFilter) {
+        var q = adminStudentFilter.toLowerCase();
+        filteredStudents = adminStudents.filter(function (st) {
+          var nm = (st.Name || st.name || "").toLowerCase();
+          var ph = (st.Phone || st.phone || "").toLowerCase();
+          return nm.indexOf(q) !== -1 || ph.indexOf(q) !== -1;
+        });
+      }
+      if (filteredStudents.length === 0) {
+        html += '<div style="text-align:center;color:var(--muted);font-size:13px;padding:2rem 0">No students match &ldquo;' + esc(adminStudentFilter) + '&rdquo;</div>';
+      } else {
+      var rosterParams = filteredStudents
         .map(function (st) {
           var ph = st.Phone || st.phone || "";
           var nm = st.Name || st.name || "";
@@ -2116,13 +2214,15 @@ function renderAdminPanelHTML() {
         '<div style="max-height:360px;overflow-y:auto;padding-right:4px">' +
         rosterParams +
         "</div>";
+    } // close filteredStudents.length > 0
     } else {
       html +=
         '<div style="text-align:center;color:var(--muted);font-size:13px;padding:2rem 0">No students registered yet.</div>';
     }
 
     html +=
-      '<button class="btn-secondary" style="margin-top:16px" onclick="closeAdmin()">Close</button></div>';
+      '<button class="btn-secondary" style="margin-top:16px" onclick="closeAdmin()">Close</button>' +
+      '<button class="btn-secondary" style="margin-top:4px;color:var(--red);border-color:var(--red-border)" onclick="adminLogout()">Log out</button></div>';
     return html;
   }
 
@@ -2157,6 +2257,7 @@ function renderAdminPanelHTML() {
       '<button class="btn-primary" style="margin-top:12px" onclick="adminSaveDeadline()">Save deadline</button>' +
       '<button class="btn-danger" style="margin-top:8px;width:100%" onclick="adminClearDeadline()">Clear deadline (open registration)</button>' +
       '<button class="btn-secondary" onclick="closeAdmin()">Close</button>' +
+      '<button class="btn-secondary" style="margin-top:4px;color:var(--red);border-color:var(--red-border)" onclick="adminLogout()">Log out</button>' +
       "</div>"
     );
   }
@@ -2185,7 +2286,8 @@ function renderAdminPanelHTML() {
       '<div class="mode-card-desc">Students choose Main-first or Speaking-first. Their estimated schedule is shown on the details page. Configure per session in the Sessions tab.</div>' +
       "</div>" +
       '<div id="admin-mode-status" class="admin-status"></div>' +
-      '<button class="btn-secondary" onclick="closeAdmin()">Close</button></div>'
+      '<button class="btn-secondary" onclick="closeAdmin()">Close</button>' +
+      '<button class="btn-secondary" style="margin-top:4px;color:var(--red);border-color:var(--red-border)" onclick="adminLogout()">Log out</button></div>'
     );
   }
 
@@ -2292,6 +2394,7 @@ function renderAdminPanelHTML() {
     '<button class="btn-primary" style="margin-top:12px" onclick="adminSaveSessions()">Save sessions</button>' +
     '<button class="btn-secondary" onclick="adminSessionDraft=null;render()">Discard changes</button>' +
     '<button class="btn-secondary" onclick="closeAdmin()">Close</button>' +
+    '<button class="btn-secondary" style="margin-top:4px;color:var(--red);border-color:var(--red-border)" onclick="adminLogout()">Log out</button>' +
     "</div>"
   );
 }
@@ -2473,6 +2576,7 @@ async function adminSaveSessions() {
       statusEl.textContent = "Sessions saved successfully!";
       statusEl.className = "admin-status ok";
     }
+    showToast("Sessions saved successfully", "success");
     // Re-render sessions tab in-place to reflect updated session list (preserving status msg)
     var rowsContainer = document.querySelector(".admin-panel");
     if (rowsContainer) {
