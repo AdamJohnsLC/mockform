@@ -45,6 +45,7 @@ var submitting = false;
 var loadError = false;
 var loadErrorMsg = "";
 var newSlotChoice = null;
+var hasAnimatedCards = false; // only animate cards on first appearance
 // --- Admin & deadline ---
 var ADMIN_HASH =
   "4e00966f7d1e666e33b9f63bfad60646e023890a664d10a2e9df11331c46d976";
@@ -565,7 +566,7 @@ function renderStep1() {
     // Full only when all available pools are empty
     var isFull = isMSSession(s.id) ? mainRem <= 0 && spkRem <= 0 : rem === 0;
     var isSel = form.slot === s.id;
-    var cls = ["time-card", isFull ? "full" : "", isSel ? "selected" : ""]
+    var cls = ["time-card", isFull ? "full" : "", isSel ? "selected" : "", !hasAnimatedCards ? "animate-in" : ""]
       .filter(Boolean)
       .join(" ");
     var seatText = isFull
@@ -887,7 +888,7 @@ function renderManage() {
       : '<button class="btn-green" onclick="goChangeSlot()" ' +
         (submitting ? "disabled" : "") +
         ">Change my session</button>") +
-    (reg.examType && isMSSession(reg.slotId)
+    (reg.examType && isMSSession(reg.slotId) && !isRegistrationClosed()
       ? '<button class="btn-secondary" onclick="goChangeExamType()" ' +
         (submitting ? "disabled" : "") +
         ">" +
@@ -896,9 +897,11 @@ function renderManage() {
           : "&#128187;&nbsp; Change to Main Exam") +
         "</button>"
       : "") +
-    '<button class="btn-danger" onclick="cancelRegistration()" ' +
-    (submitting ? "disabled" : "") +
-    ">Cancel my registration</button>" +
+    (isRegistrationClosed()
+      ? '<button class="btn-danger" disabled style="opacity:0.45;cursor:not-allowed">Cancel my registration</button>'
+      : '<button class="btn-danger" onclick="cancelRegistration()" ' +
+        (submitting ? "disabled" : "") +
+        ">Cancel my registration</button>") +
     "</div>"
   );
 }
@@ -999,7 +1002,12 @@ function renderChangeSlot() {
 
 function render() {
   var el = document.getElementById("main");
-  if (step === 1) el.innerHTML = renderStep1();
+  if (step === 1) {
+    el.innerHTML = renderStep1();
+    if (!hasAnimatedCards) {
+      hasAnimatedCards = true;
+    }
+  }
   else if (step === 5) el.innerHTML = renderExamType();
   else if (step === 2) {
     el.innerHTML = renderStep2();

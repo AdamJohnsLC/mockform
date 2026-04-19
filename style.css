@@ -183,12 +183,12 @@
     @keyframes fadeSlideIn { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:translateY(0); } }
     @keyframes staggerCard { from { opacity:0; transform:translateY(16px) scale(0.97); } to { opacity:1; transform:translateY(0) scale(1); } }
     #app { animation: fadeSlideIn 0.5s cubic-bezier(0.22,1,0.36,1) both; }
-    #main { animation: fadeSlideIn 0.3s ease-out both; }
-    .time-card { animation: staggerCard 0.4s cubic-bezier(0.22,1,0.36,1) both; }
-    .time-card:nth-child(1) { animation-delay: 0.05s; }
-    .time-card:nth-child(2) { animation-delay: 0.12s; }
-    .time-card:nth-child(3) { animation-delay: 0.19s; }
-    .time-card:nth-child(4) { animation-delay: 0.26s; }
+    .time-card { transition: border-color 0.15s, background 0.15s, transform 0.15s; }
+    .time-card.animate-in { animation: staggerCard 0.4s cubic-bezier(0.22,1,0.36,1) both; }
+    .time-card.animate-in:nth-child(1) { animation-delay: 0.05s; }
+    .time-card.animate-in:nth-child(2) { animation-delay: 0.12s; }
+    .time-card.animate-in:nth-child(3) { animation-delay: 0.19s; }
+    .time-card.animate-in:nth-child(4) { animation-delay: 0.26s; }
 
     /* Success checkmark draw */
     @keyframes checkDraw { from { stroke-dashoffset: 30; } to { stroke-dashoffset: 0; } }
