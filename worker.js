@@ -670,10 +670,10 @@ async function botRules(token, chatId) {
     chat_id: chatId,
     text:
       "⚠️ <b>Test Day Rules</b>\n\n" +
-      "1️⃣ <b>Bring ID:</b> You must bring your student ID or Passport.\n" +
-      "2️⃣ <b>Pencils/Pens:</b> Bring your own stationery and an eraser.\n" +
-      "3️⃣ <b>No Phones:</b> Phones and smartwatches must be turned off and handed in.\n" +
-      "4️⃣ <b>Late Policy:</b> If you are more than 10 minutes late, you will not be allowed to enter.",
+      "1️⃣ <b>Bring A sheet of Paper:</b> Bring a clean paper to write your notes\n" +
+      "2️⃣ <b>Pencils/Pens:</b> Bring your own pen or pencil.\n" +
+      "3️⃣ <b>No Phones:</b> Phones and smartwatches must be set to mute or turned off and handed in.\n" +
+      "4️⃣ <b>Late Policy:</b> If you are more than 15 minutes late, you will not be allowed to enter and lose your seat.",
     parse_mode: "HTML"
   });
 }
