@@ -839,6 +839,8 @@ function renderManage() {
     step = 1;
     return renderStep1();
   }
+  var tgPhone = (reg.phone || '').replace(/\D/g, '');
+  var tgLink = 'https://t.me/ajmockbot?start=998' + tgPhone;
   return (
     '<div class="success-screen">' +
     '<div class="confetti-wrap"><div class="confetti-dot"></div><div class="confetti-dot"></div><div class="confetti-dot"></div><div class="confetti-dot"></div><div class="confetti-dot"></div><div class="confetti-dot"></div><div class="confetti-dot"></div><div class="confetti-dot"></div></div>' +
@@ -878,6 +880,14 @@ function renderManage() {
     esc(reg.school) +
     "</span></div>" +
     "</div>" +
+    '<div id="tg-reminder-card" style="display:flex;align-items:center;gap:12px;background:rgba(36,161,222,0.1);border:1px solid rgba(36,161,222,0.2);border-radius:12px;padding:14px 16px;margin:16px 0">' +
+    '<div style="font-size:22px;flex-shrink:0">&#128172;</div>' +
+    '<div style="flex:1">' +
+    '<div style="font-size:14px;font-weight:600;color:#24a1de">Get Telegram Reminders</div>' +
+    '<div style="font-size:12px;color:var(--muted);margin-top:3px">We&#39;ll message you the evening before your test</div>' +
+    '</div>' +
+    '<a href="' + tgLink + '" target="_blank" rel="noopener" style="display:inline-block;background:#24a1de;color:#fff;font-size:13px;font-weight:600;padding:8px 16px;border-radius:8px;text-decoration:none;white-space:nowrap">Open Bot</a>' +
+    '</div>' +
     (isRegistrationClosed()
       ? '<div class="deadline-warning">' +
         '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>' +

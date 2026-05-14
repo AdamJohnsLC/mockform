@@ -9,3 +9,5 @@ directory = "./"
 binding = "MOCK_DB"
 id = "b50116de23d643fb81b0e1ba27de8923"
 
+[triggers]
+crons = ["0 15 * * *"]
