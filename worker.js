@@ -26,8 +26,8 @@ export default {
       });
     }
 
-    // Telegram bot webhook
-    if (url.pathname === "/bot") {
+    // Telegram bot webhook (Forgiving check for /bot or //bot)
+    if (url.pathname === "/bot" || url.pathname === "//bot" || url.pathname.endsWith("/bot")) {
       return handleBot(request, env);
     }
 
@@ -37,7 +37,12 @@ export default {
     }
 
     // Everything else → serve static file (index.html, style.css, app.js)
-    return env.ASSETS.fetch(request);
+    // SAFETY CHECK: Prevent the "Cannot read properties of undefined (reading 'fetch')" crash
+    if (env.ASSETS) {
+      return env.ASSETS.fetch(request);
+    }
+    
+    return new Response("Not Found", { status: 404 });
   },
 
   async scheduled(event, env, ctx) {
@@ -433,6 +438,10 @@ async function handleBot(request, env) {
       await botStatus(db, token, chatId);
     } else if (text === "/help") {
       await botHelp(token, chatId);
+    } else if (text === "/location") {
+      await botLocation(token, chatId);
+    } else if (text === "/rules") {
+      await botRules(token, chatId);
     } else if (text === "/send_now" && userId === ADMIN_TELEGRAM_ID) {
       await botSendNow(db, token, chatId);
     } else if (text === "/stats" && userId === ADMIN_TELEGRAM_ID) {
@@ -631,11 +640,41 @@ async function botHelp(token, chatId) {
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
     text:
-      "\ud83d\udccb <b>Available Commands</b>\n\n" +
-      "/start \u2014 Link your registration\n" +
-      "/status \u2014 View your registration details\n" +
-      "/help \u2014 Show this message",
+      "📋 <b>Available Commands</b>\n\n" +
+      "/start — Link your registration\n" +
+      "/status — View your registration details\n" +
+      "/location — Get test center location\n" +
+      "/rules — Read test day rules\n" +
+      "/help — Show this message",
     parse_mode: "HTML",
+  });
+}
+
+// /location
+async function botLocation(token, chatId) {
+  await sendTelegram(token, "sendMessage", {
+    chat_id: chatId,
+    text:
+      "📍 <b>Test Center Location</b>\n\n" +
+      "We are located at: <b>Ishonch building</b>\n" +
+      "🗺️ <a href='https://maps.app.goo.gl/Bm5eUVXhBvFfSSDy9'>Open in Google Maps</a>\n\n" +
+      "<i>Please arrive 10-15 minutes before your scheduled time.</i>",
+    parse_mode: "HTML",
+    disable_web_page_preview: false
+  });
+}
+
+// /rules
+async function botRules(token, chatId) {
+  await sendTelegram(token, "sendMessage", {
+    chat_id: chatId,
+    text:
+      "⚠️ <b>Test Day Rules</b>\n\n" +
+      "1️⃣ <b>Bring ID:</b> You must bring your student ID or Passport.\n" +
+      "2️⃣ <b>Pencils/Pens:</b> Bring your own stationery and an eraser.\n" +
+      "3️⃣ <b>No Phones:</b> Phones and smartwatches must be turned off and handed in.\n" +
+      "4️⃣ <b>Late Policy:</b> If you are more than 10 minutes late, you will not be allowed to enter.",
+    parse_mode: "HTML"
   });
 }
 
@@ -885,4 +924,3 @@ async function handleScheduled(env) {
     // Admin notification is best-effort
   }
 }
-
