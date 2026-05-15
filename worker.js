@@ -26,8 +26,7 @@ export default {
       });
     }
 
-    // Telegram bot webhook (Forgiving check for /bot or //bot)
-    // Telegram bot webhook (Fixes the infinite loop!)
+   // Telegram bot webhook (Fixes the infinite loop!)
     if (url.pathname === "/bot" || url.pathname === "//bot" || url.pathname.endsWith("/bot")) {
       if (request.method === "POST") {
         ctx.waitUntil(handleBotAsync(request.clone(), env));
@@ -510,105 +509,17 @@ async function handleBotAsync(request, env) {
   }
 }
 
-var message = update.message;
-  if (!message) return new Response("OK", { status: 200 });
-
-  var chatId = message.chat.id;
-  var userId = message.from ? message.from.id : 0;
-  var text = (message.text || "").trim();
-
-  try {
-    if (text.startsWith("/start")) {
-      var payload = text.length > 7 ? text.slice(7).trim() : "";
-      if (payload) {
-        await botDeepLink(db, token, chatId, payload);
-      } else {
-        await botWelcome(token, chatId);
-      }
-    } 
-    else if (text === "/status" || text === "📋 My Status") {
-      await botStatus(db, token, chatId);
-    } 
-    else if (text === "/location" || text === "📍 Location") {
-      await botLocation(token, chatId);
-    } 
-    else if (text === "/rules" || text === "⚠️ Test Rules") {
-      await botRules(token, chatId);
-    } 
-    else if (text === "/help" || text === "❓ Help") {
-      await botHelp(token, chatId);
-    } 
-    // ADMIN COMMANDS
-    else if ((text === "/send_now" || text === "🚨 Force Reminders") && userId === ADMIN_TELEGRAM_ID) {
-      await botSendNow(db, token, chatId);
-    } 
-    else if ((text === "/stats" || text === "📊 Bot Stats") && userId === ADMIN_TELEGRAM_ID) {
-      await botStats(db, token, chatId);
-    } 
-    else if ((text === "🚨 Force Reminders" || text === "📊 Bot Stats") && userId !== ADMIN_TELEGRAM_ID) {
-      await sendTelegram(token, "sendMessage", { chat_id: chatId, text: "⛔ This command is for admins only." });
-    } 
-    else {
-      await sendTelegram(token, "sendMessage", {
-        chat_id: chatId,
-        text: "I don't understand that command.\nPlease use the menu buttons below.",
-        reply_markup: getReplyKeyboard(chatId) // Ensure keyboard stays visible!
-      });
-    }
-  } catch (err) {}
-
-  // Tell Telegram we received the click (this stops the loading icon on the button)
-  if (callbackQuery) {
-    await sendTelegram(token, "answerCallbackQuery", { callback_query_id: callbackQuery.id });
-  }
-
-  try {
-    if (text.startsWith("/start")) {
-      var payload = text.length > 7 ? text.slice(7).trim() : "";
-      if (payload) {
-        await botDeepLink(db, token, chatId, payload);
-      } else {
-        await botWelcome(token, chatId);
-      }
-    } else if (text === "/status") {
-      await botStatus(db, token, chatId);
-    } else if (text === "/help") {
-      await botHelp(token, chatId);
-    } else if (text === "/location") {
-      await botLocation(token, chatId);
-    } else if (text === "/rules") {
-      await botRules(token, chatId);
-    } else if (text === "/send_now" && userId === ADMIN_TELEGRAM_ID) {
-      await botSendNow(db, token, chatId);
-    } else if (text === "/stats" && userId === ADMIN_TELEGRAM_ID) {
-      await botStats(db, token, chatId);
-    } else if (
-      (text === "/send_now" || text === "/stats") &&
-      userId !== ADMIN_TELEGRAM_ID
-    ) {
-      await sendTelegram(token, "sendMessage", {
-        chat_id: chatId,
-        text: "\u26d4 This command is for admins only.",
-      });
-    } else {
-      await sendTelegram(token, "sendMessage", {
-        chat_id: chatId,
-        text: "I don't understand that command.\nType /help to see available commands.",
-      });
-    }
-  } catch (err) {
-    // Swallow errors to prevent Telegram webhook retries
-  }
-
-  return new Response("OK", { status: 200 });
-
 // --- NEW HELPER: Generates the persistent Reply Keyboard ---
-function getReplyKeyboard() {
+function getReplyKeyboard(chatId) {
+  var kb = [
+    [{ text: "📋 My Status" }, { text: "📍 Location" }],
+    [{ text: "⚠️ Test Rules" }, { text: "❓ Help" }]
+  ];
+  if (chatId === ADMIN_TELEGRAM_ID) {
+    kb.push([{ text: "📊 Bot Stats" }, { text: "🚨 Force Reminders" }]);
+  }
   return { 
-    keyboard: [
-      [{ text: "📋 My Status" }, { text: "📍 Location" }],
-      [{ text: "⚠️ Test Rules" }, { text: "❓ Help" }]
-    ],
+    keyboard: kb, 
     resize_keyboard: true, 
     is_persistent: true 
   };
@@ -706,7 +617,7 @@ async function botDeepLink(db, token, chatId, phone) {
     chat_id: chatId,
     text: msg,
     parse_mode: "HTML",
-    reply_markup: getReplyKeyboard(chatId) // <-- Add this line!
+     reply_markup: getReplyKeyboard(chatId) // <-- Add this line!
   });
 }
 
