@@ -27,8 +27,12 @@ export default {
     }
 
     // Telegram bot webhook (Forgiving check for /bot or //bot)
+    // Telegram bot webhook (Fixes the infinite loop!)
     if (url.pathname === "/bot" || url.pathname === "//bot" || url.pathname.endsWith("/bot")) {
-      return handleBot(request, env);
+      if (request.method === "POST") {
+        ctx.waitUntil(handleBotAsync(request.clone(), env));
+      }
+      return new Response("OK", { status: 200 }); // Instantly tells Telegram to stop retrying
     }
 
     // Route /api/* to handler
@@ -449,23 +453,62 @@ async function sendTelegram(token, method, body) {
   return resp.json();
 }
 
-async function handleBot(request, env) {
-  if (request.method !== "POST") {
-    return new Response("OK", { status: 200 });
-  }
-
+async function handleBotAsync(request, env) {
   var token = env.BOT_TOKEN;
   var db = env.MOCK_DB;
-  if (!token || !db) {
-    return new Response("Bot not configured", { status: 500 });
-  }
+  if (!token || !db) return;
 
-  var update;
   try {
-    update = await request.json();
-  } catch (e) {
-    return new Response("Bad request", { status: 400 });
+    var update = await request.json();
+    var message = update.message;
+    if (!message) return;
+
+    var chatId = message.chat.id;
+    var userId = message.from ? message.from.id : 0;
+    var text = (message.text || "").trim();
+
+    if (text.startsWith("/start")) {
+      var payload = text.length > 7 ? text.slice(7).trim() : "";
+      if (payload) {
+        await botDeepLink(db, token, chatId, payload);
+      } else {
+        await botWelcome(token, chatId);
+      }
+    } 
+    // FIXED: Using .includes() to ignore invisible emoji characters
+    else if (text === "/status" || text.includes("My Status")) {
+      await botStatus(db, token, chatId);
+    } 
+    else if (text === "/location" || text.includes("Location")) {
+      await botLocation(token, chatId);
+    } 
+    else if (text === "/rules" || text.includes("Test Rules")) {
+      await botRules(token, chatId);
+    } 
+    else if (text === "/help" || text.includes("Help")) {
+      await botHelp(token, chatId);
+    } 
+    // Hidden Admin Commands (You can type these manually)
+    else if (text === "/send_now" && userId === ADMIN_TELEGRAM_ID) {
+      await botSendNow(db, token, chatId);
+    } 
+    else if (text === "/stats" && userId === ADMIN_TELEGRAM_ID) {
+      await botStats(db, token, chatId);
+    } 
+    else if ((text === "/send_now" || text === "/stats") && userId !== ADMIN_TELEGRAM_ID) {
+      await sendTelegram(token, "sendMessage", { chat_id: chatId, text: "⛔ This command is for admins only." });
+    } 
+    else {
+      await sendTelegram(token, "sendMessage", {
+        chat_id: chatId,
+        text: "I don't understand that command.\nPlease use the menu buttons below.",
+        reply_markup: getReplyKeyboard()
+      });
+    }
+  } catch (err) {
+    // Fails quietly in the background without causing infinite loops
   }
+}
 
 var message = update.message;
   if (!message) return new Response("OK", { status: 200 });
@@ -558,19 +601,14 @@ var message = update.message;
   }
 
   return new Response("OK", { status: 200 });
-}
 
 // --- NEW HELPER: Generates the persistent Reply Keyboard ---
-function getReplyKeyboard(chatId) {
-  var kb = [
-    [{ text: "📋 My Status" }, { text: "📍 Location" }],
-    [{ text: "⚠️ Test Rules" }, { text: "❓ Help" }]
-  ];
-  if (chatId === ADMIN_TELEGRAM_ID) {
-    kb.push([{ text: "📊 Bot Stats" }, { text: "🚨 Force Reminders" }]);
-  }
+function getReplyKeyboard() {
   return { 
-    keyboard: kb, 
+    keyboard: [
+      [{ text: "📋 My Status" }, { text: "📍 Location" }],
+      [{ text: "⚠️ Test Rules" }, { text: "❓ Help" }]
+    ],
     resize_keyboard: true, 
     is_persistent: true 
   };
