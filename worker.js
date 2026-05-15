@@ -253,6 +253,22 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
       rows.push(payload);
       await db.put("Registrations", JSON.stringify(rows));
       bgSync(); // background sync to Google Sheets
+
+      // --- NEW: Registration Notification for already-linked Telegram users ---
+      if (token && phone) {
+        try {
+          const users = await db.get("TelegramUsers", "json") || {};
+          const cid = users[phone.replace(/\D/g, "")];
+          if (cid) {
+            let msg = "🎉 <b>Registration Successful!</b>\n\nYou have successfully registered for the mock test.";
+            if (payload.Session) msg += "\n🕒 Session: <b>" + payload.Session.replace(/ \(est\.\)$/, "") + "</b>";
+            if (payload.ExamType) msg += "\n📝 Exam: <b>" + payload.ExamType + "</b>";
+            await sendTelegram(token, "sendMessage", { chat_id: cid, text: msg, parse_mode: "HTML" });
+          }
+        } catch (e) {}
+      }
+      // ----------------------------------------------------------------------
+
       return new Response(JSON.stringify({ created: 1 }), {
         status: 201,
         headers: corsHeaders,
@@ -451,16 +467,52 @@ async function handleBot(request, env) {
     return new Response("Bad request", { status: 400 });
   }
 
-  var message = update.message;
-  var callbackQuery = update.callback_query;
+var message = update.message;
+  if (!message) return new Response("OK", { status: 200 });
 
-  // If it's not a message and not a button click, ignore it
-  if (!message && !callbackQuery) return new Response("OK", { status: 200 });
+  var chatId = message.chat.id;
+  var userId = message.from ? message.from.id : 0;
+  var text = (message.text || "").trim();
 
-  // Get ID and text depending on if they typed or clicked a button
-  var chatId = message ? message.chat.id : callbackQuery.message.chat.id;
-  var userId = message ? (message.from ? message.from.id : 0) : callbackQuery.from.id;
-  var text = message ? (message.text || "").trim() : callbackQuery.data;
+  try {
+    if (text.startsWith("/start")) {
+      var payload = text.length > 7 ? text.slice(7).trim() : "";
+      if (payload) {
+        await botDeepLink(db, token, chatId, payload);
+      } else {
+        await botWelcome(token, chatId);
+      }
+    } 
+    else if (text === "/status" || text === "📋 My Status") {
+      await botStatus(db, token, chatId);
+    } 
+    else if (text === "/location" || text === "📍 Location") {
+      await botLocation(token, chatId);
+    } 
+    else if (text === "/rules" || text === "⚠️ Test Rules") {
+      await botRules(token, chatId);
+    } 
+    else if (text === "/help" || text === "❓ Help") {
+      await botHelp(token, chatId);
+    } 
+    // ADMIN COMMANDS
+    else if ((text === "/send_now" || text === "🚨 Force Reminders") && userId === ADMIN_TELEGRAM_ID) {
+      await botSendNow(db, token, chatId);
+    } 
+    else if ((text === "/stats" || text === "📊 Bot Stats") && userId === ADMIN_TELEGRAM_ID) {
+      await botStats(db, token, chatId);
+    } 
+    else if ((text === "🚨 Force Reminders" || text === "📊 Bot Stats") && userId !== ADMIN_TELEGRAM_ID) {
+      await sendTelegram(token, "sendMessage", { chat_id: chatId, text: "⛔ This command is for admins only." });
+    } 
+    else {
+      await sendTelegram(token, "sendMessage", {
+        chat_id: chatId,
+        text: "I don't understand that command.\nPlease use the menu buttons below.",
+        reply_markup: getReplyKeyboard(chatId) // Ensure keyboard stays visible!
+      });
+    }
+  } catch (err) {}
 
   // Tell Telegram we received the click (this stops the loading icon on the button)
   if (callbackQuery) {
@@ -508,27 +560,41 @@ async function handleBot(request, env) {
   return new Response("OK", { status: 200 });
 }
 
+// --- NEW HELPER: Generates the persistent Reply Keyboard ---
+function getReplyKeyboard(chatId) {
+  var kb = [
+    [{ text: "📋 My Status" }, { text: "📍 Location" }],
+    [{ text: "⚠️ Test Rules" }, { text: "❓ Help" }]
+  ];
+  if (chatId === ADMIN_TELEGRAM_ID) {
+    kb.push([{ text: "📊 Bot Stats" }, { text: "🚨 Force Reminders" }]);
+  }
+  return { 
+    keyboard: kb, 
+    resize_keyboard: true, 
+    is_persistent: true 
+  };
+}
+
 // /start (no payload) — welcome message
 async function botWelcome(token, chatId) {
-  // Create the modern inline buttons
-  var buttons = [
-    [{ text: "📋 My Status", callback_data: "/status" }, { text: "📍 Location", callback_data: "/location" }],
-    [{ text: "⚠️ Test Rules", callback_data: "/rules" }, { text: "❓ Help", callback_data: "/help" }]
-  ];
-
-  // If you (the Admin) open the bot, automatically add secret Admin buttons!
-  if (chatId === ADMIN_TELEGRAM_ID) {
-    buttons.push([{ text: "📊 Bot Stats", callback_data: "/stats" }, { text: "🚨 Force Send Reminders", callback_data: "/send_now" }]);
-  }
-
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
     text:
       "👋 <b>Welcome to the Mock Test Reminder Bot!</b>\n\n" +
       "To receive reminders, register on the website and click the Telegram link on the success page.\n\n" +
-      "👇 <b>Click a button below to get started:</b>",
+      "👇 <b>Use the keyboard below to manage your registration:</b>",
     parse_mode: "HTML",
-    reply_markup: { inline_keyboard: buttons } // This attaches the buttons!
+    reply_markup: getReplyKeyboard(chatId)
+  });
+}
+
+// /help
+async function botHelp(token, chatId) {
+  await sendTelegram(token, "sendMessage", {
+    chat_id: chatId,
+    text: "Here is what I can do! Tap a button on your keyboard below:",
+    reply_markup: getReplyKeyboard(chatId)
   });
 }
 
@@ -602,6 +668,7 @@ async function botDeepLink(db, token, chatId, phone) {
     chat_id: chatId,
     text: msg,
     parse_mode: "HTML",
+    reply_markup: getReplyKeyboard(chatId) // <-- Add this line!
   });
 }
 
@@ -683,23 +750,7 @@ async function botStatus(db, token, chatId) {
   });
 }
 
-// /help
-async function botHelp(token, chatId) {
-  var buttons = [
-    [{ text: "📋 My Status", callback_data: "/status" }, { text: "📍 Location", callback_data: "/location" }],
-    [{ text: "⚠️ Test Rules", callback_data: "/rules" }]
-  ];
 
-  if (chatId === ADMIN_TELEGRAM_ID) {
-    buttons.push([{ text: "📊 Bot Stats", callback_data: "/stats" }, { text: "🚨 Force Send Reminders", callback_data: "/send_now" }]);
-  }
-
-  await sendTelegram(token, "sendMessage", {
-    chat_id: chatId,
-    text: "Here is what I can do! Tap a button below:",
-    reply_markup: { inline_keyboard: buttons }
-  });
-}
 // /location
 async function botLocation(token, chatId) {
   await sendTelegram(token, "sendMessage", {
