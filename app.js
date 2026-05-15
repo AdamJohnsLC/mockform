@@ -54,6 +54,7 @@ var headerClickTimer = null;
 var adminAuthenticated = false;
 var adminStatus = "";
 var deadline = null; // Date object or null
+var testDate = null; // Date object for actual test day (Bot Reminders)
 var adminActiveTab = "deadline"; // 'deadline' or 'sessions'
 var adminSessionDraft = null; // working copy while editing sessions
 var adminFailedAttempts = 0;
@@ -1890,15 +1891,16 @@ async function saveDeadline(isoString) {
     headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH },
     body: JSON.stringify({ data: { Value: isoString } }),
   });
-  if (!res.ok) {
-    var body = "";
-    try {
-      body = await res.text();
-    } catch (e2) {}
-    throw new Error(
-      "HTTP " + res.status + (body ? ": " + body.slice(0, 120) : ""),
-    );
-  }
+  if (!res.ok) throw new Error("HTTP " + res.status);
+}
+
+async function saveTestDate(isoString) {
+  var res = await fetch(API + "/Key/test_date?sheet=Settings", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH },
+    body: JSON.stringify({ data: { Value: isoString } }),
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
 }
 
 async function clearDeadline() {
@@ -1921,29 +1923,39 @@ async function clearDeadline() {
 async function loadDeadline() {
   deadlineLoadError = null;
   try {
-    var res = await fetch(API + "/search?sheet=Settings&Key=deadline");
-    if (!res.ok) {
-      deadlineLoadError = "Settings sheet returned HTTP " + res.status;
-      return;
+    // 1. Load Registration Deadline
+    var res1 = await fetch(API + "/search?sheet=Settings&Key=deadline");
+    if (res1.ok) {
+      var rows1 = await res1.json();
+      if (rows1 && rows1.length) {
+        var val1 = rows1[0]["Value"] !== undefined ? rows1[0]["Value"] : rows1[0]["value"];
+        if (val1) deadline = new Date(val1);
+      }
     }
-    var rows = await res.json();
-    if (!rows || !rows.length) {
-      deadlineLoadError =
-        'Settings sheet found but no rows returned. Add a row with Key="deadline" and leave Value empty.';
-      return;
-    }
-    var val =
-      rows[0]["Value"] !== undefined ? rows[0]["Value"] : rows[0]["value"];
-    if (val) {
-      var d = new Date(val);
-      if (!isNaN(d.getTime())) deadline = d;
-      else
-        deadlineLoadError =
-          'Stored deadline value "' + val + '" is not a valid date.';
+    
+    // 2. Load Actual Test Date
+    var res2 = await fetch(API + "/search?sheet=Settings&Key=test_date");
+    if (res2.ok) {
+      var rows2 = await res2.json();
+      if (rows2 && rows2.length) {
+        var val2 = rows2[0]["Value"] !== undefined ? rows2[0]["Value"] : rows2[0]["value"];
+        if (val2) testDate = new Date(val2);
+      }
     }
   } catch (e) {
     deadlineLoadError = "Could not reach Settings sheet: " + e.message;
   }
+}
+
+function formatTestDate(d) {
+  if (!d) return "Not set";
+  return d.toLocaleString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function toLocalDateString(d) {
+  if (!d) return "";
+  var pad = function (n) { return String(n).padStart(2, "0"); };
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
 }
 
 function isRegistrationClosed() {
@@ -2247,33 +2259,34 @@ function renderAdminPanelHTML() {
   if (adminActiveTab === "deadline") {
     var deadlineStr = deadline ? toLocalDatetimeString(deadline) : "";
     var currentDisplay = deadline
-      ? '<div class="deadline-display">Current deadline: <strong>' +
-        formatDeadline(deadline) +
-        "</strong></div>"
+      ? '<div class="deadline-display">Current deadline: <strong>' + formatDeadline(deadline) + "</strong></div>"
       : '<div class="deadline-display" style="color:#888">No deadline set — registration is open.</div>';
-    var allErrors = [deadlineLoadError, sessionConfigError]
-      .filter(Boolean)
-      .join(" | ");
-    var errorHtml = allErrors
-      ? '<div style="background:#FCEBEB;border:1px solid #F09595;border-radius:8px;padding:10px 14px;font-size:12px;color:#791F1F;margin-bottom:12px">⚠ ' +
-        esc(allErrors) +
-        "</div>"
-      : "";
+
+    var testDateStr = testDate ? toLocalDateString(testDate) : "";
+    var testDateDisplay = testDate
+      ? '<div class="deadline-display" style="margin-top:4px">Test Date (Bot Reminders): <strong>' + formatTestDate(testDate) + "</strong></div>"
+      : '<div class="deadline-display" style="color:#888;margin-top:4px">No test date set for bot reminders.</div>';
+
+    var allErrors = [deadlineLoadError, sessionConfigError].filter(Boolean).join(" | ");
+    var errorHtml = allErrors ? '<div style="background:#FCEBEB;border:1px solid #F09595;border-radius:8px;padding:10px 14px;font-size:12px;color:#791F1F;margin-bottom:12px">⚠ ' + esc(allErrors) + "</div>" : "";
+    
     return (
       '<div class="admin-panel">' +
       '<div class="admin-title">Settings</div>' +
       tabs +
       errorHtml +
       currentDisplay +
-      '<label style="font-size:13px;font-weight:500;color:#555;display:block;margin-bottom:6px">New deadline</label>' +
-      '<input id="admin-deadline-input" class="admin-input" type="datetime-local" value="' +
-      deadlineStr +
-      '" min="' +
-      toLocalDatetimeString(new Date()) +
-      '" />' +
+      testDateDisplay +
+      
+      '<div style="margin-top:16px"><label style="font-size:13px;font-weight:500;color:#555;display:block;margin-bottom:6px">Registration Close Deadline (Time)</label>' +
+      '<input id="admin-deadline-input" class="admin-input" type="datetime-local" value="' + deadlineStr + '" min="' + toLocalDatetimeString(new Date()) + '" /></div>' +
+      
+      '<div style="margin-top:12px"><label style="font-size:13px;font-weight:500;color:#555;display:block;margin-bottom:6px">Actual Test Date (For Bot Reminders & Cleanup)</label>' +
+      '<input id="admin-testdate-input" class="admin-input" type="date" value="' + testDateStr + '" /></div>' +
+      
       '<div id="admin-save-status" class="admin-status"></div>' +
-      '<button class="btn-primary" style="margin-top:12px" onclick="adminSaveDeadline()">Save deadline</button>' +
-      '<button class="btn-danger" style="margin-top:8px;width:100%" onclick="adminClearDeadline()">Clear deadline (open registration)</button>' +
+      '<button class="btn-primary" style="margin-top:12px" onclick="adminSaveDates()">Save Settings</button>' +
+      '<button class="btn-danger" style="margin-top:8px;width:100%" onclick="adminClearDates()">Clear Both Dates</button>' +
       '<button class="btn-secondary" onclick="closeAdmin()">Close</button>' +
       '<button class="btn-secondary" style="margin-top:4px;color:var(--red);border-color:var(--red-border)" onclick="adminLogout()">Log out</button>' +
       "</div>"
@@ -2620,91 +2633,68 @@ async function adminSaveSessions() {
     }
   }
 }
-
-async function adminSaveDeadline() {
-  var inp = document.getElementById("admin-deadline-input");
+async function adminSaveDates() {
+  var inpD = document.getElementById("admin-deadline-input");
+  var inpT = document.getElementById("admin-testdate-input");
   var statusEl = document.getElementById("admin-save-status");
-  if (!inp || !inp.value) {
-    if (statusEl) {
-      statusEl.textContent = "Please select a date and time.";
-      statusEl.className = "admin-status err";
-    }
-    return;
-  }
+  
   var btn = document.querySelector(".admin-panel .btn-primary");
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "Saving…";
-  }
+  if (btn) { btn.disabled = true; btn.textContent = "Saving…"; }
+  
   try {
-    // Parse datetime-local value as local time explicitly (avoids timezone ambiguity)
-    var parts = inp.value.split(/[\-T:]/);
-    var localDate = new Date(
-      +parts[0],
-      +parts[1] - 1,
-      +parts[2],
-      +parts[3],
-      +parts[4],
-    );
-    var isoString = localDate.toISOString();
-    await saveDeadline(isoString);
-    deadline = new Date(isoString);
+    // Save Registration Deadline
+    if (inpD && inpD.value) {
+      var parts = inpD.value.split(/[\-T:]/);
+      var localDate = new Date(+parts[0], +parts[1] - 1, +parts[2], +parts[3], +parts[4]);
+      var isoString = localDate.toISOString();
+      await saveDeadline(isoString);
+      deadline = new Date(isoString);
+    }
+    
+    // Save Test Date
+    if (inpT && inpT.value) {
+      var partsT = inpT.value.split("-");
+      var localTestDate = new Date(+partsT[0], +partsT[1] - 1, +partsT[2]); // Midnight local time
+      var isoStringT = localTestDate.toISOString();
+      await saveTestDate(isoStringT);
+      testDate = new Date(isoStringT);
+    }
+    
     if (statusEl) {
-      statusEl.textContent = "Saved! Deadline: " + formatDeadline(deadline);
+      statusEl.textContent = "Dates saved successfully!";
       statusEl.className = "admin-status ok";
     }
-    // Update deadline display in-place without wiping status message
-    var dd = document.querySelector(".deadline-display");
-    if (dd) {
-      dd.innerHTML =
-        "Current deadline: <strong>" + formatDeadline(deadline) + "</strong>";
-    }
+    setTimeout(function() { render(); }, 1200);
   } catch (e) {
     if (statusEl) {
-      statusEl.textContent =
-        "Save failed: " + (e.message || "check your connection.");
+      statusEl.textContent = "Save failed: " + e.message;
       statusEl.className = "admin-status err";
     }
   } finally {
-    var saveBtn = document.querySelector(".admin-panel .btn-primary");
-    if (saveBtn) {
-      saveBtn.disabled = false;
-      saveBtn.textContent = "Save deadline";
-    }
+    if (btn) { btn.disabled = false; btn.textContent = "Save Settings"; }
   }
 }
 
-async function adminClearDeadline() {
+async function adminClearDates() {
   var statusEl = document.getElementById("admin-save-status");
   var btn = document.querySelector(".admin-panel .btn-danger");
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "Clearing…";
-  }
+  if (btn) { btn.disabled = true; btn.textContent = "Clearing…"; }
   try {
-    await clearDeadline();
+    // Clear both from Cloudflare
+    await fetch(API + "/Key/deadline?sheet=Settings", { method: "PATCH", headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH }, body: JSON.stringify({ data: { Value: "" } }) });
+    await fetch(API + "/Key/test_date?sheet=Settings", { method: "PATCH", headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH }, body: JSON.stringify({ data: { Value: "" } }) });
+    
     deadline = null;
+    testDate = null;
     if (statusEl) {
-      statusEl.textContent = "Deadline cleared — registration is now open.";
+      statusEl.textContent = "Both dates cleared!";
       statusEl.className = "admin-status ok";
     }
-    // Update deadline display in-place
-    var dd2 = document.querySelector(".deadline-display");
-    if (dd2) {
-      dd2.style.color = "#888";
-      dd2.textContent = "No deadline set — registration is open.";
-    }
+    setTimeout(function() { render(); }, 1200);
   } catch (e) {
-    if (statusEl) {
-      statusEl.textContent = "Clear failed — check your connection.";
-      statusEl.className = "admin-status err";
-    }
+    if (statusEl) { statusEl.textContent = "Clear failed."; statusEl.className = "admin-status err"; }
   } finally {
-    var clearBtn = document.querySelector(".admin-panel .btn-danger");
-    if (clearBtn) {
-      clearBtn.disabled = false;
-      clearBtn.textContent = "Clear deadline (open registration)";
-    }
+    if (btn) { btn.disabled = false; btn.textContent = "Clear Both Dates"; }
   }
 }
 

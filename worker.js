@@ -168,6 +168,7 @@ async function handleApi(request, env, url, ctx) {
 // ----------------------------------------------------
 async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
   const db = env.MOCK_DB;
+  const token = env.BOT_TOKEN; // <-- Added this!
   if (!db) {
     return new Response(
       JSON.stringify({ error: "MOCK_DB KV namespace not bound" }),
@@ -263,6 +264,22 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
       const parts = subPath.split("/").filter(Boolean);
       if (parts.length === 2) {
         const phoneToDel = decodeURIComponent(parts[1]);
+        
+        // --- NEW: Send Cancellation Notification ---
+        if (token) {
+          try {
+            const users = await db.get("TelegramUsers", "json") || {};
+            const cid = users[phoneToDel.replace(/\D/g, "")];
+            if (cid) {
+              await sendTelegram(token, "sendMessage", {
+                chat_id: cid,
+                text: "❌ <b>Registration Cancelled</b>\n\nYour mock test registration has been successfully cancelled. If this was a mistake, please register again on the website.",
+                parse_mode: "HTML"
+              });
+            }
+          } catch (e) {}
+        }
+
         rows = rows.filter((r) => String(r.Phone) !== String(phoneToDel));
         await db.put("Registrations", JSON.stringify(rows));
         bgSync(); // background sync to Google Sheets
@@ -289,6 +306,21 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
         if (updated > 0) {
           await db.put("Registrations", JSON.stringify(rows));
           bgSync();
+
+          // --- NEW: Send Update Notification ---
+          if (token) {
+            try {
+              const users = await db.get("TelegramUsers", "json") || {};
+              const cid = users[phoneToUpdate.replace(/\D/g, "")];
+              if (cid) {
+                let msg = "🔄 <b>Registration Updated</b>\n\nYour mock test details were successfully updated!";
+                if (payload.Session) msg += "\n🕒 New Session: <b>" + payload.Session + "</b>";
+                if (payload.ExamType) msg += "\n📝 Exam: <b>" + payload.ExamType + "</b>";
+                
+                await sendTelegram(token, "sendMessage", { chat_id: cid, text: msg, parse_mode: "HTML" });
+              }
+            } catch (e) {}
+          }
         }
         return new Response(JSON.stringify({ updated: updated }), {
           status: 200,
@@ -420,11 +452,20 @@ async function handleBot(request, env) {
   }
 
   var message = update.message;
-  if (!message) return new Response("OK", { status: 200 });
+  var callbackQuery = update.callback_query;
 
-  var chatId = message.chat.id;
-  var userId = message.from ? message.from.id : 0;
-  var text = (message.text || "").trim();
+  // If it's not a message and not a button click, ignore it
+  if (!message && !callbackQuery) return new Response("OK", { status: 200 });
+
+  // Get ID and text depending on if they typed or clicked a button
+  var chatId = message ? message.chat.id : callbackQuery.message.chat.id;
+  var userId = message ? (message.from ? message.from.id : 0) : callbackQuery.from.id;
+  var text = message ? (message.text || "").trim() : callbackQuery.data;
+
+  // Tell Telegram we received the click (this stops the loading icon on the button)
+  if (callbackQuery) {
+    await sendTelegram(token, "answerCallbackQuery", { callback_query_id: callbackQuery.id });
+  }
 
   try {
     if (text.startsWith("/start")) {
@@ -469,18 +510,25 @@ async function handleBot(request, env) {
 
 // /start (no payload) — welcome message
 async function botWelcome(token, chatId) {
+  // Create the modern inline buttons
+  var buttons = [
+    [{ text: "📋 My Status", callback_data: "/status" }, { text: "📍 Location", callback_data: "/location" }],
+    [{ text: "⚠️ Test Rules", callback_data: "/rules" }, { text: "❓ Help", callback_data: "/help" }]
+  ];
+
+  // If you (the Admin) open the bot, automatically add secret Admin buttons!
+  if (chatId === ADMIN_TELEGRAM_ID) {
+    buttons.push([{ text: "📊 Bot Stats", callback_data: "/stats" }, { text: "🚨 Force Send Reminders", callback_data: "/send_now" }]);
+  }
+
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
     text:
-      "\ud83d\udc4b <b>Welcome to the Mock Test Reminder Bot!</b>\n\n" +
-      "To receive reminders:\n" +
-      "1. Register at the mock test website\n" +
-      '2. Click the <b>"Get Telegram Reminders"</b> link on your success page\n\n' +
-      "That's it! I'll message you the evening before the test.\n\n" +
-      "<b>Commands:</b>\n" +
-      "/status \u2014 Check your registration\n" +
-      "/help \u2014 Show this message",
+      "👋 <b>Welcome to the Mock Test Reminder Bot!</b>\n\n" +
+      "To receive reminders, register on the website and click the Telegram link on the success page.\n\n" +
+      "👇 <b>Click a button below to get started:</b>",
     parse_mode: "HTML",
+    reply_markup: { inline_keyboard: buttons } // This attaches the buttons!
   });
 }
 
@@ -637,19 +685,21 @@ async function botStatus(db, token, chatId) {
 
 // /help
 async function botHelp(token, chatId) {
+  var buttons = [
+    [{ text: "📋 My Status", callback_data: "/status" }, { text: "📍 Location", callback_data: "/location" }],
+    [{ text: "⚠️ Test Rules", callback_data: "/rules" }]
+  ];
+
+  if (chatId === ADMIN_TELEGRAM_ID) {
+    buttons.push([{ text: "📊 Bot Stats", callback_data: "/stats" }, { text: "🚨 Force Send Reminders", callback_data: "/send_now" }]);
+  }
+
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
-    text:
-      "📋 <b>Available Commands</b>\n\n" +
-      "/start — Link your registration\n" +
-      "/status — View your registration details\n" +
-      "/location — Get test center location\n" +
-      "/rules — Read test day rules\n" +
-      "/help — Show this message",
-    parse_mode: "HTML",
+    text: "Here is what I can do! Tap a button below:",
+    reply_markup: { inline_keyboard: buttons }
   });
 }
-
 // /location
 async function botLocation(token, chatId) {
   await sendTelegram(token, "sendMessage", {
@@ -715,19 +765,19 @@ async function botStats(db, token, chatId) {
   }
   var unlinked = totalStudents - linked;
 
-  var settings = await db.get("Settings", "json");
+ var settings = await db.get("Settings", "json");
   if (!settings || typeof settings !== "object") settings = {};
-  var deadlineStr = settings.deadline || null;
+  var testDateStr = settings.test_date || null;
   var reminderSent = settings.reminder_sent || "Never";
 
   var msg =
-    "\ud83d\udcca <b>Bot Statistics</b>\n\n" +
-    "\ud83d\udc65 Total registered: <b>" + totalStudents + "</b>\n" +
-    "\u2705 Linked to Telegram: <b>" + linked + "</b>\n" +
-    "\u274c Not linked: <b>" + unlinked + "</b>";
+    "📊 <b>Bot Statistics</b>\n\n" +
+    "👥 Total registered: <b>" + totalStudents + "</b>\n" +
+    "✅ Linked to Telegram: <b>" + linked + "</b>\n" +
+    "❌ Not linked: <b>" + unlinked + "</b>";
 
-  if (deadlineStr) {
-    var d = new Date(deadlineStr);
+  if (testDateStr) {
+    var d = new Date(testDateStr);
     var dUZT = new Date(d.getTime() + UZT_OFFSET_MS);
     msg +=
       "\n\n\ud83d\udcc5 Test date: <b>" +
@@ -759,12 +809,12 @@ async function sendAllReminders(db, token) {
   var settings = await db.get("Settings", "json");
   if (!settings || typeof settings !== "object") settings = {};
 
-  var deadlineStr = settings.deadline;
-  if (!deadlineStr)
-    return { sent: 0, failed: 0, unlinked: 0, error: "No deadline set" };
+var testDateStr = settings.test_date;
+  if (!testDateStr)
+    return { sent: 0, failed: 0, unlinked: 0, error: "No test date set" };
 
   // Format test date for display
-  var testDate = new Date(deadlineStr);
+  var testDate = new Date(testDateStr);
   var testDateUZT = new Date(testDate.getTime() + UZT_OFFSET_MS);
   var testDateStr =
     testDateUZT.getDate() + " " +
@@ -876,10 +926,11 @@ async function handleScheduled(env) {
   var settings = await db.get("Settings", "json");
   if (!settings || typeof settings !== "object") settings = {};
 
-  var deadlineStr = settings.deadline;
-  if (!deadlineStr) return; // No test date set
+  // Look for the actual test date, not the registration deadline
+  var actualTestDateStr = settings.test_date;
+  if (!actualTestDateStr) return; // Admin hasn't set the test date yet
 
-  var testDate = new Date(deadlineStr);
+  var testDate = new Date(actualTestDateStr);
   if (isNaN(testDate.getTime())) return;
 
   // Calculate dates in Uzbekistan time (UTC+5)
@@ -889,6 +940,34 @@ async function handleScheduled(env) {
   tomorrowUZT.setDate(tomorrowUZT.getDate() + 1);
 
   var testDateUZT = new Date(testDate.getTime() + UZT_OFFSET_MS);
+
+  // --- NEW: AUTO-CLEANUP LOGIC ---
+  // If today is strictly AFTER the test date, wipe the database
+  var isTestOver = 
+    (nowUZT.getFullYear() > testDateUZT.getFullYear()) ||
+    (nowUZT.getFullYear() === testDateUZT.getFullYear() && nowUZT.getMonth() > testDateUZT.getMonth()) ||
+    (nowUZT.getFullYear() === testDateUZT.getFullYear() && nowUZT.getMonth() === testDateUZT.getMonth() && nowUZT.getDate() > testDateUZT.getDate());
+
+ if (isTestOver && settings.cleaned_up !== actualTestDateStr) {
+    // 1. Wipe all students and Telegram links
+    await db.put("Registrations", JSON.stringify([]));
+    await db.put("TelegramUsers", JSON.stringify({}));
+    
+ // 2. Mark this test date as "cleaned up" so it doesn't wipe repeatedly
+    settings.cleaned_up = actualTestDateStr;
+    await db.put("Settings", JSON.stringify(settings));
+    
+    // 3. Notify the Admin
+    try {
+      await sendTelegram(token, "sendMessage", {
+        chat_id: ADMIN_TELEGRAM_ID,
+        text: "🧹 <b>Database Auto-Cleaned</b>\n\nThe test day has passed! All registered students and Telegram links have been wiped to prepare for your next test.",
+        parse_mode: "HTML"
+      });
+    } catch(e) {}
+    
+    return; // Exit early, no need to send reminders for an old test
+  }
 
   // Is tomorrow the test day?
   var isTomorrow =
@@ -914,13 +993,11 @@ async function handleScheduled(env) {
     await sendTelegram(token, "sendMessage", {
       chat_id: ADMIN_TELEGRAM_ID,
       text:
-        "\ud83d\udd14 <b>Automated Reminders Sent</b>\n\n" +
-        "\ud83d\udce8 Sent: " + result.sent +
-        "\n\u274c Failed: " + result.failed +
-        "\n\ud83d\udd17 Not linked: " + result.unlinked,
+        "🔔 <b>Automated Reminders Sent</b>\n\n" +
+        "📤 Sent: " + result.sent +
+        "\n❌ Failed: " + result.failed +
+        "\n🔗 Not linked: " + result.unlinked,
       parse_mode: "HTML",
     });
-  } catch (e) {
-    // Admin notification is best-effort
-  }
+  } catch (e) {}
 }
