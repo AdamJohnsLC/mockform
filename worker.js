@@ -510,16 +510,12 @@ async function handleBotAsync(request, env) {
 }
 
 // --- NEW HELPER: Generates the persistent Reply Keyboard ---
-function getReplyKeyboard(chatId) {
-  var kb = [
-    [{ text: "📋 My Status" }, { text: "📍 Location" }],
-    [{ text: "⚠️ Test Rules" }, { text: "❓ Help" }]
-  ];
-  if (chatId === ADMIN_TELEGRAM_ID) {
-    kb.push([{ text: "📊 Bot Stats" }, { text: "🚨 Force Reminders" }]);
-  }
+function getReplyKeyboard() {
   return { 
-    keyboard: kb, 
+    keyboard: [
+      [{ text: "📋 My Status" }, { text: "📍 Location" }],
+      [{ text: "⚠️ Test Rules" }, { text: "❓ Help" }]
+    ],
     resize_keyboard: true, 
     is_persistent: true 
   };
