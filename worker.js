@@ -26,12 +26,18 @@ export default {
       });
     }
 
-   // Telegram bot webhook (Fixes the infinite loop!)
+    // Telegram bot webhook
     if (url.pathname === "/bot" || url.pathname === "//bot" || url.pathname.endsWith("/bot")) {
       if (request.method === "POST") {
-        ctx.waitUntil(handleBotAsync(request.clone(), env));
+        try {
+          // WE MUST READ THE MESSAGE FIRST before telling Telegram "OK", otherwise it gets deleted!
+          const update = await request.json();
+          // Now safely pass it to the background task
+          ctx.waitUntil(handleBotAsync(update, env));
+        } catch (e) {}
       }
-      return new Response("OK", { status: 200 }); // Instantly tells Telegram to stop retrying
+      // Instantly tell Telegram "OK" so it never loops again!
+      return new Response("OK", { status: 200 }); 
     }
 
     // Route /api/* to handler
@@ -452,13 +458,12 @@ async function sendTelegram(token, method, body) {
   return resp.json();
 }
 
-async function handleBotAsync(request, env) {
+async function handleBotAsync(update, env) {
   var token = env.BOT_TOKEN;
   var db = env.MOCK_DB;
   if (!token || !db) return;
 
   try {
-    var update = await request.json();
     var message = update.message;
     if (!message) return;
 
@@ -474,7 +479,7 @@ async function handleBotAsync(request, env) {
         await botWelcome(token, chatId);
       }
     } 
-    // FIXED: Using .includes() to ignore invisible emoji characters
+    // Ignore invisible emoji characters
     else if (text === "/status" || text.includes("My Status")) {
       await botStatus(db, token, chatId);
     } 
@@ -487,7 +492,7 @@ async function handleBotAsync(request, env) {
     else if (text === "/help" || text.includes("Help")) {
       await botHelp(token, chatId);
     } 
-    // Hidden Admin Commands (You can type these manually)
+    // Hidden Admin Commands (Type these manually to use them!)
     else if (text === "/send_now" && userId === ADMIN_TELEGRAM_ID) {
       await botSendNow(db, token, chatId);
     } 
@@ -505,7 +510,7 @@ async function handleBotAsync(request, env) {
       });
     }
   } catch (err) {
-    // Fails quietly in the background without causing infinite loops
+    // Fails quietly in the background
   }
 }
 
