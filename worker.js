@@ -228,7 +228,7 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
     if (method === "GET") {
       // If a search query is provided (e.g. ?Phone=...), filter
       if (subPath === "/search" || subPath.startsWith("/search")) {
-        const filtered = rows.filter((r) => {
+        const filtered = rows.map(correctRegistration).filter((r) => {
           for (const key in qsParams) {
             if (key === "sheet") continue;
             if (String(r[key]) !== String(qsParams[key])) return false;
@@ -240,7 +240,7 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
           headers: corsHeaders,
         });
       }
-      return new Response(JSON.stringify(rows), {
+      return new Response(JSON.stringify(rows.map(correctRegistration)), {
         status: 200,
         headers: corsHeaders,
       });
@@ -248,6 +248,7 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
 
     // --- POST: add a new registration ---
     if (method === "POST" && payload) {
+      correctRegistration(payload);
       // Duplicate phone check
       const phone = payload.Phone;
       if (phone) {
@@ -260,6 +261,7 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
         }
       }
       rows.push(payload);
+      rows = rows.map(correctRegistration);
       await db.put("Registrations", JSON.stringify(rows));
       bgSync(); // background sync to Google Sheets
 
@@ -319,7 +321,7 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
           } catch (e) {}
         }
 
-        rows = rows.filter((r) => String(r.Phone) !== String(phoneToDel));
+        rows = rows.map(correctRegistration).filter((r) => String(r.Phone) !== String(phoneToDel));
         await db.put("Registrations", JSON.stringify(rows));
         bgSync(); // background sync to Google Sheets
       }
@@ -333,14 +335,16 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
     if (method === "PATCH" && subPath.startsWith("/Phone/")) {
       const parts = subPath.split("/").filter(Boolean);
       if (parts.length === 2 && payload) {
+        correctRegistration(payload);
         const phoneToUpdate = decodeURIComponent(parts[1]);
         let updated = 0;
         rows = rows.map((r) => {
           if (String(r.Phone) === String(phoneToUpdate)) {
             updated++;
-            return Object.assign({}, r, payload);
+            var correctedRow = correctRegistration(r);
+            return Object.assign({}, correctedRow, payload);
           }
-          return r;
+          return correctRegistration(r);
         });
         if (updated > 0) {
           await db.put("Registrations", JSON.stringify(rows));
@@ -590,6 +594,7 @@ async function botDeepLink(db, token, chatId, phone) {
   // Look up registration by phone
   var regs = await db.get("Registrations", "json");
   if (!Array.isArray(regs)) regs = [];
+  regs = regs.map(correctRegistration);
 
   var reg = null;
   for (var i = 0; i < regs.length; i++) {
@@ -680,6 +685,7 @@ async function botStatus(db, token, chatId) {
 
   var regs = await db.get("Registrations", "json");
   if (!Array.isArray(regs)) regs = [];
+  regs = regs.map(correctRegistration);
 
   var reg = null;
   for (var j = 0; j < regs.length; j++) {
@@ -792,6 +798,7 @@ async function botSendNow(db, token, chatId) {
 async function botStats(db, token, chatId) {
   var regs = await db.get("Registrations", "json");
   if (!Array.isArray(regs)) regs = [];
+  regs = regs.map(correctRegistration);
 
   var users = await db.get("TelegramUsers", "json");
   if (!users || typeof users !== "object") users = {};
@@ -862,6 +869,7 @@ var testDateStr = settings.test_date;
 
   var regs = await db.get("Registrations", "json");
   if (!Array.isArray(regs)) regs = [];
+  regs = regs.map(correctRegistration);
 
   var users = await db.get("TelegramUsers", "json");
   if (!users || typeof users !== "object") users = {};
@@ -996,6 +1004,70 @@ function formatStudentNotification(name, session, examType, speakTime, mainTime,
     msg += "\nGood luck! 🍀";
   }
   return msg;
+}
+
+function parseTimeToMin(timeStr) {
+  if (!timeStr) return NaN;
+  var clean = String(timeStr).replace(/ \(est\.\)$/, "").trim();
+  var p = clean.split(":");
+  if (p.length < 2) return NaN;
+  return parseInt(p[0], 10) * 60 + parseInt(p[1], 10);
+}
+
+function correctRegistration(reg) {
+  if (!reg) return reg;
+
+  var session = reg.Session || reg.session;
+  var examType = reg.ExamType || reg.examtype;
+  var speakTime = reg.SpeakingTime || reg.speakingtime;
+  var mainTime = reg.MainTime || reg.maintime;
+
+  if (!session || !examType) return reg;
+
+  var sessionMin = parseTimeToMin(session);
+  if (isNaN(sessionMin)) return reg;
+
+  var et = String(examType).trim().toLowerCase();
+  
+  if (et === "main" || et === "main first") {
+    if (speakTime) {
+      var speakMin = parseTimeToMin(speakTime);
+      if (!isNaN(speakMin)) {
+        var diff = speakMin - sessionMin - 150;
+        if (diff >= 0 && diff % 15 === 0) {
+          var newSpeakMin = speakMin + 10;
+          var newSpeakStr = formatMinutesToHHMM(newSpeakMin);
+          if (String(speakTime).endsWith(" (est.)")) {
+            newSpeakStr += " (est.)";
+          }
+          if (reg.SpeakingTime !== undefined) reg.SpeakingTime = newSpeakStr;
+          if (reg.speakingtime !== undefined) reg.speakingtime = newSpeakStr;
+          if (reg.SpeakingTime === undefined && reg.speakingtime === undefined) {
+            reg.SpeakingTime = newSpeakStr;
+          }
+        }
+      }
+    }
+  } else if (et === "speaking" || et === "speaking first") {
+    if (mainTime) {
+      var mainMin = parseTimeToMin(mainTime);
+      if (!isNaN(mainMin)) {
+        if (mainMin === sessionMin + 150) {
+          var newMainMin = mainMin + 10;
+          var newMainStr = formatMinutesToHHMM(newMainMin);
+          if (String(mainTime).endsWith(" (est.)")) {
+            newMainStr += " (est.)";
+          }
+          if (reg.MainTime !== undefined) reg.MainTime = newMainStr;
+          if (reg.maintime !== undefined) reg.maintime = newMainStr;
+          if (reg.MainTime === undefined && reg.maintime === undefined) {
+            reg.MainTime = newMainStr;
+          }
+        }
+      }
+    }
+  }
+  return reg;
 }
 
 // ============================================================
