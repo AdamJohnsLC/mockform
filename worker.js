@@ -269,10 +269,24 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
           const users = await db.get("TelegramUsers", "json") || {};
           const cid = users[phone.replace(/\D/g, "")];
           if (cid) {
-            let msg = "🎉 <b>Registration Successful!</b>\n\nYou have successfully registered for the mock test.";
-            if (payload.Session) msg += "\n🕒 Session: <b>" + payload.Session.replace(/ \(est\.\)$/, "") + "</b>";
-            if (payload.ExamType) msg += "\n📝 Exam: <b>" + payload.ExamType + "</b>";
-            await sendTelegram(token, "sendMessage", { chat_id: cid, text: msg, parse_mode: "HTML" });
+            let settings = await db.get("Settings", "json") || {};
+            let testDateStr = "";
+            if (settings.test_date) {
+              var d = new Date(settings.test_date);
+              var dUZT = new Date(d.getTime() + UZT_OFFSET_MS);
+              testDateStr = dUZT.getDate() + " " + MONTHS[dUZT.getMonth()] + " " + dUZT.getFullYear();
+            }
+            let msg = formatStudentNotification(
+              payload.Name,
+              payload.Session,
+              payload.ExamType,
+              payload.SpeakingTime,
+              payload.MainTime,
+              testDateStr,
+              payload.School,
+              "🎉 <b>Registration Successful!</b>\n\nYou have successfully registered for the mock test."
+            );
+            await sendTelegram(token, "sendMessage", { chat_id: cid, text: msg, parse_mode: "HTML", disable_web_page_preview: true });
           }
         } catch (e) {}
       }
@@ -338,11 +352,25 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
               const users = await db.get("TelegramUsers", "json") || {};
               const cid = users[phoneToUpdate.replace(/\D/g, "")];
               if (cid) {
-                let msg = "🔄 <b>Registration Updated</b>\n\nYour mock test details were successfully updated!";
-                if (payload.Session) msg += "\n🕒 New Session: <b>" + payload.Session + "</b>";
-                if (payload.ExamType) msg += "\n📝 Exam: <b>" + payload.ExamType + "</b>";
-                
-                await sendTelegram(token, "sendMessage", { chat_id: cid, text: msg, parse_mode: "HTML" });
+                const fullReg = rows.find(r => String(r.Phone) === String(phoneToUpdate)) || payload;
+                let settings = await db.get("Settings", "json") || {};
+                let testDateStr = "";
+                if (settings.test_date) {
+                  var d = new Date(settings.test_date);
+                  var dUZT = new Date(d.getTime() + UZT_OFFSET_MS);
+                  testDateStr = dUZT.getDate() + " " + MONTHS[dUZT.getMonth()] + " " + dUZT.getFullYear();
+                }
+                let msg = formatStudentNotification(
+                  fullReg.Name || fullReg.name,
+                  fullReg.Session || fullReg.session,
+                  fullReg.ExamType || fullReg.examtype,
+                  fullReg.SpeakingTime || fullReg.speakingtime,
+                  fullReg.MainTime || fullReg.maintime,
+                  testDateStr,
+                  fullReg.School || fullReg.school,
+                  "🔄 <b>Registration Updated</b>\n\nYour mock test details were successfully updated!"
+                );
+                await sendTelegram(token, "sendMessage", { chat_id: cid, text: msg, parse_mode: "HTML", disable_web_page_preview: true });
               }
             } catch (e) {}
           }
@@ -598,21 +626,24 @@ async function botDeepLink(db, token, chatId, phone) {
   var speakTime = String(reg.SpeakingTime || "").replace(/ \(est\.\)$/, "");
   var mainTime = String(reg.MainTime || "").replace(/ \(est\.\)$/, "");
 
-  var msg =
-    "\u2705 <b>Successfully linked!</b>\n\n" +
-    "Hi " + escHtml(name) + "! \ud83d\udc4b\n\n" +
-    "Your registration details:\n" +
-    "\u23f0 Session: <b>" + escHtml(session) + "</b>";
+  var settings = await db.get("Settings", "json") || {};
+  var testDateStr = "";
+  if (settings.test_date) {
+    var d = new Date(settings.test_date);
+    var dUZT = new Date(d.getTime() + UZT_OFFSET_MS);
+    testDateStr = dUZT.getDate() + " " + MONTHS[dUZT.getMonth()] + " " + dUZT.getFullYear();
+  }
 
-  if (examType)
-    msg += "\n\ud83d\udcdd Exam Type: <b>" + escHtml(examType) + "</b>";
-  if (speakTime)
-    msg += "\n\ud83c\udfa4 Speaking: <b>" + escHtml(speakTime) + "</b>";
-  if (mainTime && examType.toLowerCase() !== "main")
-    msg += "\n\ud83d\udccb Main Exam: <b>" + escHtml(mainTime) + "</b>";
-
-  msg +=
-    "\n\nI'll send you a reminder the evening before the test. Good luck! \ud83c\udf40";
+  var msg = formatStudentNotification(
+    name,
+    session,
+    examType,
+    speakTime,
+    mainTime,
+    testDateStr,
+    reg.School || reg.school || "",
+    "✅ <b>Successfully linked!</b>\n\nHi " + escHtml(name) + "! 👋\n\nYour registration details:"
+  );
 
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
@@ -680,23 +711,30 @@ async function botStatus(db, token, chatId) {
   var mainTime = String(reg.MainTime || "").replace(/ \(est\.\)$/, "");
   var school = reg.School || reg.school || "";
 
-  var msg =
-    "\ud83d\udccb <b>Your Registration</b>\n\n" +
-    "\ud83d\udc64 Name: " + escHtml(name) + "\n" +
-    "\u23f0 Session: <b>" + escHtml(session) + "</b>";
-  if (examType)
-    msg += "\n\ud83d\udcdd Exam Type: <b>" + escHtml(examType) + "</b>";
-  if (speakTime)
-    msg += "\n\ud83c\udfa4 Speaking: <b>" + escHtml(speakTime) + "</b>";
-  if (mainTime)
-    msg += "\n\ud83d\udccb Main Exam: <b>" + escHtml(mainTime) + "</b>";
-  if (school) msg += "\n\ud83c\udfeb School: " + escHtml(school);
-  msg += "\n\n\u2705 Reminders are active.";
+  var settings = await db.get("Settings", "json") || {};
+  var testDateStr = "";
+  if (settings.test_date) {
+    var d = new Date(settings.test_date);
+    var dUZT = new Date(d.getTime() + UZT_OFFSET_MS);
+    testDateStr = dUZT.getDate() + " " + MONTHS[dUZT.getMonth()] + " " + dUZT.getFullYear();
+  }
+
+  var msg = formatStudentNotification(
+    name,
+    session,
+    examType,
+    speakTime,
+    mainTime,
+    testDateStr,
+    school,
+    "📋 <b>Your Registration Status</b>\n\nYour reminders are fully active! ✅\nHere are your current details:"
+  );
 
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
     text: msg,
     parse_mode: "HTML",
+    disable_web_page_preview: true,
   });
 }
 
@@ -848,41 +886,24 @@ var testDateStr = settings.test_date;
     var speakTime = String(reg.SpeakingTime || "").replace(/ \(est\.\)$/, "");
     var mainTime = String(reg.MainTime || "").replace(/ \(est\.\)$/, "");
 
-    // Build the reminder message
-    var msg =
-      "\ud83d\udccb <b>Mock Test Reminder</b>\n\n" +
-      "Hello, " + escHtml(name) + "! \ud83d\udc4b\n\n" +
-      "Your mock test is <b>TOMORROW</b>.\n\n" +
-      "\ud83d\udcc5 Date: <b>" + testDateStr + "</b>\n" +
-      "\u23f0 Session: <b>" + escHtml(session) + "</b>";
-
-    if (examType.toLowerCase() === "speaking") {
-      if (speakTime)
-        msg += "\n\ud83c\udfa4 Speaking First: <b>" + escHtml(speakTime) + "</b>";
-      if (mainTime)
-        msg += "\n\ud83d\udcdd Main Exam: <b>" + escHtml(mainTime) + "</b>";
-    } else if (examType.toLowerCase() === "main") {
-      msg += "\n\ud83d\udcdd Exam Type: <b>Main</b> (L+R+W first)";
-      if (speakTime)
-        msg += "\n\ud83c\udfa4 Speaking Time: <b>" + escHtml(speakTime) + "</b>";
-    }
-
-    msg += "\n\n\ud83d\udccd Arrive 10 minutes early with your student ID.";
-
-    // Suggest alarm time (30 min before session)
-    var alarm = suggestAlarm(session);
-    if (alarm)
-      msg +=
-        "\n\ud83d\udca1 <i>Tip: Set an alarm for " + alarm +
-        " so you don't miss it.</i>";
-
-    msg += "\n\nGood luck! \ud83c\udf40";
+    var msg = formatStudentNotification(
+      name,
+      session,
+      examType,
+      speakTime,
+      mainTime,
+      testDateStr,
+      reg.School || reg.school || "",
+      "📋 <b>Mock Test Reminder</b>\n\nHello, " + escHtml(name) + "! 👋\n\nYour mock test is <b>TOMORROW</b>.",
+      true
+    );
 
     try {
       await sendTelegram(token, "sendMessage", {
         chat_id: cid,
         text: msg,
         parse_mode: "HTML",
+        disable_web_page_preview: true,
       });
       sent++;
     } catch (e) {
@@ -914,6 +935,67 @@ function escHtml(s) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+function getSessionMinutes(label) {
+  var p = label.split(":");
+  return parseInt(p[0]) * 60 + parseInt(p[1]);
+}
+
+function formatMinutesToHHMM(m) {
+  var h = Math.floor(m / 60) % 24,
+    n = m % 60;
+  return (h < 10 ? "0" : "") + h + ":" + (n < 10 ? "0" : "") + n;
+}
+
+function formatStudentNotification(name, session, examType, speakTime, mainTime, testDateStr, school, prefixText, isReminder) {
+  var s = String(session || "").replace(/ \(est\.\)$/, "").trim();
+  var et = String(examType || "").trim();
+  var st = String(speakTime || "").replace(/ \(est\.\)$/, "").trim();
+  var mt = String(mainTime || "").replace(/ \(est\.\)$/, "").trim();
+
+  var msg = prefixText + "\n\n";
+  if (name) msg += "👤 Name: <b>" + escHtml(name) + "</b>\n";
+  if (testDateStr) msg += "📅 Date: <b>" + escHtml(testDateStr) + "</b>\n";
+  msg += "🕒 Session: <b>" + escHtml(s) + "</b>\n";
+
+  var sessionMin = getSessionMinutes(s);
+  
+  if (et.toLowerCase() === "speaking") {
+    msg += "📝 Exam Type: <b>Speaking First</b> (Speaking before main exam)\n";
+    if (st) msg += "🎤 Speaking First: <b>" + escHtml(st) + "</b>\n";
+    if (mt) msg += "📋 Main Exam: <b>" + escHtml(mt) + "</b>\n";
+    msg += "\n📍 Location: <b>Ishonch building</b> (<a href=\"https://maps.app.goo.gl/Bm5eUVXhBvFfSSDy9\">Open in Google Maps</a>)\n";
+    
+    if (!isNaN(sessionMin)) {
+      var mainStart = formatMinutesToHHMM(sessionMin + 160);
+      var speakEnd = formatMinutesToHHMM(sessionMin + 150);
+      msg += "\n⚠️ <i>Note: There is a 10-minute transition break after the speaking session ends at " + speakEnd + ". Your main exam starts at " + mainStart + ".</i>";
+    }
+  } else {
+    msg += "📝 Exam Type: <b>Main First</b> (Listening, Reading, Writing first)\n";
+    if (st) msg += "🎤 Speaking Time: <b>" + escHtml(st) + "</b>\n";
+    msg += "\n📍 Location: <b>Ishonch building</b> (<a href=\"https://maps.app.goo.gl/Bm5eUVXhBvFfSSDy9\">Open in Google Maps</a>)\n";
+    
+    if (!isNaN(sessionMin)) {
+      var mainEnd = formatMinutesToHHMM(sessionMin + 150);
+      var firstSpeak = formatMinutesToHHMM(sessionMin + 160);
+      msg += "\n⚠️ <i>Note: There is a 10-minute transition break after your main exam ends at " + mainEnd + ". Speaking tests start at " + firstSpeak + " (your specific slot is at " + st + ").</i>";
+    }
+  }
+
+  if (school) msg += "\n🏫 School: " + escHtml(school);
+
+  if (isReminder) {
+    msg += "\n\n💡 <b>Important Tips:</b>\n" +
+           "• Arrive 10 minutes early with a pen/pencil and paper.\n";
+    var alarm = suggestAlarm(s);
+    if (alarm) {
+      msg += "• Set an alarm for <b>" + alarm + "</b> so you don't miss it!\n";
+    }
+    msg += "\nGood luck! 🍀";
+  }
+  return msg;
 }
 
 // ============================================================
@@ -950,9 +1032,10 @@ async function handleScheduled(env) {
     (nowUZT.getFullYear() === testDateUZT.getFullYear() && nowUZT.getMonth() === testDateUZT.getMonth() && nowUZT.getDate() > testDateUZT.getDate());
 
  if (isTestOver && settings.cleaned_up !== actualTestDateStr) {
-    // 1. Wipe all students and Telegram links
+    // 1. Wipe all students, Telegram links, and release all seats
     await db.put("Registrations", JSON.stringify([]));
     await db.put("TelegramUsers", JSON.stringify({}));
+    await db.put("Seats", JSON.stringify({}));
     
  // 2. Mark this test date as "cleaned up" so it doesn't wipe repeatedly
     settings.cleaned_up = actualTestDateStr;

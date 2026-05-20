@@ -80,6 +80,7 @@ try {
 var SPEAKING_SUFFIX = "_speaking";
 var MAIN_DURATION = 150; // minutes for L+R+W
 var SPEAK_DURATION = 15; // minutes per student speaking slot
+var SPEAKING_GAP = 10; // gap in minutes between main exam and speaking start
 var registrationMode = "lr_only"; // 'lr_only' | 'main_speaking'
 var examType = null; // 'main' | 'speaking' — set at step 5
 
@@ -141,14 +142,14 @@ function calcSchedule(slotId, et) {
   if (et === "main") {
     return {
       mainTime: toHHMM(start),
-      speakTime: toHHMM(start + MAIN_DURATION + spkOffset),
+      speakTime: toHHMM(start + MAIN_DURATION + SPEAKING_GAP + spkOffset),
       pos: myPos,
       teachers: teachers,
     };
   } else {
     return {
       speakTime: toHHMM(start + spkOffset),
-      mainTime: toHHMM(start + MAIN_DURATION),
+      mainTime: toHHMM(start + MAIN_DURATION + SPEAKING_GAP),
       pos: myPos,
       teachers: teachers,
     };
@@ -407,7 +408,7 @@ async function recalculateSpeakingTimes(slotId) {
         for (var i = 0; i < speakStudents.length; i++) {
           var offset = Math.floor(i / teachers) * SPEAK_DURATION;
           var newSpeak = toHHMM(start + offset);
-          var newMain = toHHMM(start + MAIN_DURATION);
+          var newMain = toHHMM(start + MAIN_DURATION + SPEAKING_GAP);
           var ph = speakStudents[i].Phone || speakStudents[i].phone || "";
           if (ph) {
             try {
@@ -441,7 +442,7 @@ async function recalculateSpeakingTimes(slotId) {
         });
         for (var j = 0; j < mainStudents.length; j++) {
           var offset2 = Math.floor(j / teachers) * SPEAK_DURATION;
-          var newSpeak2 = toHHMM(start + MAIN_DURATION + offset2);
+          var newSpeak2 = toHHMM(start + MAIN_DURATION + SPEAKING_GAP + offset2);
           var ph2 = mainStudents[j].Phone || mainStudents[j].phone || "";
           if (ph2) {
             try {
@@ -789,7 +790,7 @@ function renderStep2() {
     '<div class="section-label">Your details</div>' +
     '<div class="field-group"><label class="field-label">Full name</label>' +
     '<input id="inp-name" class="field-input ' +
-    (errors.name ? "error" : "") +
+    (errors.name ? "error error-shake" : "") +
     '" type="text" value="' +
     esc(form.name) +
     '" placeholder="e.g. Amir Karimov" maxlength="80" autocomplete="name" />' +
@@ -800,7 +801,7 @@ function renderStep2() {
     '<div class="field-group"><label class="field-label">Phone number</label>' +
     '<div class="phone-wrap"><div class="phone-prefix">+998</div>' +
     '<input id="inp-phone" class="field-input ' +
-    (errors.phone ? "error" : "") +
+    (errors.phone ? "error error-shake" : "") +
     '" type="tel" value="' +
     esc(form.phone) +
     '" placeholder="90-999-99-99" maxlength="12" style="flex:1" autocomplete="tel" /></div>' +
@@ -1012,39 +1013,51 @@ function renderChangeSlot() {
 }
 
 function render() {
+  // Push state to history so mobile back button works properly
+  if (!history.state || history.state.step !== step) {
+    history.pushState({ step: step }, "", "#step" + step);
+  }
+
   var el = document.getElementById("main");
+  var html = "";
   if (step === 1) {
-    el.innerHTML = renderStep1();
+    html = renderStep1();
     if (!hasAnimatedCards) {
       hasAnimatedCards = true;
     }
   }
-  else if (step === 5) el.innerHTML = renderExamType();
+  else if (step === 5) html = renderExamType();
   else if (step === 2) {
-    el.innerHTML = renderStep2();
-    attachNameHandler();
-    attachPhoneHandler();
-  } else if (step === 3) el.innerHTML = renderManage();
-  else if (step === 4) el.innerHTML = renderChangeSlot();
+    html = renderStep2();
+  } else if (step === 3) html = renderManage();
+  else if (step === 4) html = renderChangeSlot();
   else if (step === 99) {
-    el.innerHTML = adminAuthenticated
+    html = adminAuthenticated
       ? renderAdminPanelHTML()
       : renderAdminLoginHTML();
-    if (!adminAuthenticated) {
-      setTimeout(function () {
-        var inp = document.getElementById("admin-pw-input");
-        if (inp) {
-          inp.focus();
-          inp.onkeydown = function (e) {
-            if (e.key === "Enter") adminLogin();
-          };
-        }
-      }, 50);
-    }
   } else {
     step = 1;
-    el.innerHTML = renderStep1();
+    html = renderStep1();
   }
+
+  // Wrap in step-view-container for premium view transitions!
+  el.innerHTML = '<div class="step-view-container">' + html + '</div>';
+
+  if (step === 2) {
+    attachNameHandler();
+    attachPhoneHandler();
+  } else if (step === 99 && !adminAuthenticated) {
+    setTimeout(function () {
+      var inp = document.getElementById("admin-pw-input");
+      if (inp) {
+        inp.focus();
+        inp.onkeydown = function (e) {
+          if (e.key === "Enter") adminLogin();
+        };
+      }
+    }, 50);
+  }
+
   // Admin FAB: show on non-admin screens when authenticated
   updateAdminFab();
 }
@@ -2697,5 +2710,18 @@ async function adminClearDates() {
     if (btn) { btn.disabled = false; btn.textContent = "Clear Both Dates"; }
   }
 }
+
+// Navigate history state (Mobile Back Button fix)
+window.addEventListener("popstate", function(e) {
+  if (e.state && typeof e.state.step === 'number') {
+    step = e.state.step;
+    render();
+  } else {
+    // If no state (loaded root), check if already registered
+    var existing = getRegistration();
+    step = existing ? 3 : 1;
+    render();
+  }
+});
 
 loadSeats();
