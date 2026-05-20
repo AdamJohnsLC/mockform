@@ -113,7 +113,20 @@ async function handleApi(request, env, url, ctx) {
     qsParams.sheet === "Settings" ||
     qsParams.sheet === "Registrations"
   ) {
-    return handleKV(request, env, subPath, qsParams, parsedBody, ctx);
+    try {
+      return await handleKV(request, env, subPath, qsParams, parsedBody, ctx);
+    } catch (dbErr) {
+      return new Response(
+        JSON.stringify({ error: "Database operation failed: " + dbErr.message }),
+        {
+          status: 500,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        }
+      );
+    }
   }
 
   // ----------------------------------------------------------
@@ -204,15 +217,32 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
     body: parsedBody,
   };
 
-  // Helper: fire-and-forget sync to Google Sheets
+  // Helper: fire-and-forget sync to Google Sheets with exponential backoff retry
   function bgSync() {
     if (ctx && targetUrl && !targetUrl.includes("PASTE_YOUR_WEB")) {
       ctx.waitUntil(
-        fetch(targetUrl, {
-          method: "POST",
-          body: JSON.stringify(tunnelPayload),
-          headers: { "Content-Type": "text/plain" },
-        }).catch(() => {}),
+        (async function() {
+          const retries = 3;
+          for (let attempt = 0; attempt <= retries; attempt++) {
+            try {
+              const resp = await fetch(targetUrl, {
+                method: "POST",
+                body: JSON.stringify(tunnelPayload),
+                headers: { "Content-Type": "text/plain" },
+              });
+              if (resp.ok) return; // successful sync!
+              if (attempt < retries) {
+                await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+              }
+            } catch (e) {
+              if (attempt === retries) {
+                console.error("bgSync permanently failed after retries:", e);
+                break;
+              }
+              await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+            }
+          }
+        })()
       );
     }
   }
@@ -249,10 +279,16 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
     // --- POST: add a new registration ---
     if (method === "POST" && payload) {
       correctRegistration(payload);
-      // Duplicate phone check
+      // Duplicate phone check using normalized last 9 digits and name
       const phone = payload.Phone;
       if (phone) {
-        const exists = rows.some((r) => String(r.Phone) === String(phone));
+        const cleanPhone = String(phone).replace(/\D/g, "").slice(-9);
+        const cleanName = String(payload.Name || payload.name || "").trim().toLowerCase();
+        const exists = rows.some((r) => {
+          const rp = String(r.Phone || r.phone || "").replace(/\D/g, "").slice(-9);
+          const rn = String(r.Name || r.name || "").trim().toLowerCase();
+          return rp === cleanPhone && rn === cleanName;
+        });
         if (exists) {
           return new Response(JSON.stringify({ error: "DUPLICATE_PHONE" }), {
             status: 409,
@@ -265,11 +301,12 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
       await db.put("Registrations", JSON.stringify(rows));
       bgSync(); // background sync to Google Sheets
 
-      // --- NEW: Registration Notification for already-linked Telegram users ---
+      // --- NEW: Registration Notification for already-linked Telegram users (using normalized last 9 digits) ---
       if (token && phone) {
         try {
           const users = await db.get("TelegramUsers", "json") || {};
-          const cid = users[phone.replace(/\D/g, "")];
+          const cleanPhone = phone.replace(/\D/g, "").slice(-9);
+          const cid = users[cleanPhone];
           if (cid) {
             let settings = await db.get("Settings", "json") || {};
             let testDateStr = "";
@@ -305,12 +342,13 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
       const parts = subPath.split("/").filter(Boolean);
       if (parts.length === 2) {
         const phoneToDel = decodeURIComponent(parts[1]);
+        const cleanPhoneToDel = phoneToDel.replace(/\D/g, "").slice(-9);
         
         // --- NEW: Send Cancellation Notification ---
         if (token) {
           try {
             const users = await db.get("TelegramUsers", "json") || {};
-            const cid = users[phoneToDel.replace(/\D/g, "")];
+            const cid = users[cleanPhoneToDel];
             if (cid) {
               await sendTelegram(token, "sendMessage", {
                 chat_id: cid,
@@ -321,7 +359,10 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
           } catch (e) {}
         }
 
-        rows = rows.map(correctRegistration).filter((r) => String(r.Phone) !== String(phoneToDel));
+        rows = rows.map(correctRegistration).filter((r) => {
+          const rp = String(r.Phone || r.phone || "").replace(/\D/g, "").slice(-9);
+          return rp !== cleanPhoneToDel;
+        });
         await db.put("Registrations", JSON.stringify(rows));
         bgSync(); // background sync to Google Sheets
       }
@@ -337,9 +378,11 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
       if (parts.length === 2 && payload) {
         correctRegistration(payload);
         const phoneToUpdate = decodeURIComponent(parts[1]);
+        const cleanPhoneToUpdate = phoneToUpdate.replace(/\D/g, "").slice(-9);
         let updated = 0;
         rows = rows.map((r) => {
-          if (String(r.Phone) === String(phoneToUpdate)) {
+          const rp = String(r.Phone || r.phone || "").replace(/\D/g, "").slice(-9);
+          if (rp === cleanPhoneToUpdate) {
             updated++;
             var correctedRow = correctRegistration(r);
             return Object.assign({}, correctedRow, payload);
@@ -354,9 +397,12 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
           if (token) {
             try {
               const users = await db.get("TelegramUsers", "json") || {};
-              const cid = users[phoneToUpdate.replace(/\D/g, "")];
+              const cid = users[cleanPhoneToUpdate];
               if (cid) {
-                const fullReg = rows.find(r => String(r.Phone) === String(phoneToUpdate)) || payload;
+                const fullReg = rows.find(r => {
+                  const rp = String(r.Phone || r.phone || "").replace(/\D/g, "").slice(-9);
+                  return rp === cleanPhoneToUpdate;
+                }) || payload;
                 let settings = await db.get("Settings", "json") || {};
                 let testDateStr = "";
                 if (settings.test_date) {
@@ -478,16 +524,43 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
 const ADMIN_TELEGRAM_ID = 85075658;
 const UZT_OFFSET_MS = 5 * 60 * 60 * 1000; // UTC+5
 
-async function sendTelegram(token, method, body) {
-  var resp = await fetch(
-    "https://api.telegram.org/bot" + token + "/" + method,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    },
-  );
-  return resp.json();
+async function sendTelegram(token, method, body, retries = 3) {
+  var url = "https://api.telegram.org/bot" + token + "/" + method;
+  for (var attempt = 0; attempt <= retries; attempt++) {
+    try {
+      var resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      var data = await resp.json();
+      
+      if (data && data.ok) {
+        return data;
+      }
+      
+      // If it's a rate limit error (429) and we have retries left
+      if (data && data.error_code === 429 && attempt < retries) {
+        var retryAfter = 1;
+        if (data.parameters && typeof data.parameters.retry_after === "number") {
+          retryAfter = data.parameters.retry_after;
+        }
+        // Sleep for (retryAfter * 1000) + 500ms buffer
+        await new Promise(function(resolve) {
+          setTimeout(resolve, retryAfter * 1000 + 500);
+        });
+        continue; // Retry the loop
+      }
+      
+      return data; // Return other errors or when retries are exhausted
+    } catch (e) {
+      if (attempt === retries) throw e;
+      // Network failure: sleep 1 second and retry
+      await new Promise(function(resolve) {
+        setTimeout(resolve, 1000);
+      });
+    }
+  }
 }
 
 async function handleBotAsync(update, env) {
@@ -582,34 +655,33 @@ async function botHelp(token, chatId) {
 
 // /start <phone> — deep link from registration success page
 async function botDeepLink(db, token, chatId, phone) {
-  var normalized = phone.replace(/\D/g, "");
+  var normalized = phone.replace(/\D/g, "").slice(-9);
   if (!normalized || normalized.length < 9) {
     await sendTelegram(token, "sendMessage", {
       chat_id: chatId,
-      text: "\u274c Invalid link. Please use the link from your registration success page.",
+      text: "❌ Invalid link. Please use the link from your registration success page.",
     });
     return;
   }
 
-  // Look up registration by phone
+  // Look up all registrations by phone
   var regs = await db.get("Registrations", "json");
   if (!Array.isArray(regs)) regs = [];
   regs = regs.map(correctRegistration);
 
-  var reg = null;
+  var matchedRegs = [];
   for (var i = 0; i < regs.length; i++) {
-    var rp = String(regs[i].Phone || regs[i].phone || "").replace(/\D/g, "");
+    var rp = String(regs[i].Phone || regs[i].phone || "").replace(/\D/g, "").slice(-9);
     if (rp === normalized) {
-      reg = regs[i];
-      break;
+      matchedRegs.push(regs[i]);
     }
   }
 
-  if (!reg) {
+  if (matchedRegs.length === 0) {
     await sendTelegram(token, "sendMessage", {
       chat_id: chatId,
       text:
-        "\u274c No registration found for this phone number.\n\n" +
+        "❌ No registration found for this phone number.\n\n" +
         "Please register first at the mock test website, then click the Telegram link on your success page.",
     });
     return;
@@ -621,16 +693,6 @@ async function botDeepLink(db, token, chatId, phone) {
   users[normalized] = chatId;
   await db.put("TelegramUsers", JSON.stringify(users));
 
-  // Build confirmation message
-  var name = reg.Name || reg.name || "Student";
-  var session = String(reg.Session || reg.session || "").replace(
-    / \(est\.\)$/,
-    "",
-  );
-  var examType = reg.ExamType || reg.examtype || "";
-  var speakTime = String(reg.SpeakingTime || "").replace(/ \(est\.\)$/, "");
-  var mainTime = String(reg.MainTime || "").replace(/ \(est\.\)$/, "");
-
   var settings = await db.get("Settings", "json") || {};
   var testDateStr = "";
   if (settings.test_date) {
@@ -639,22 +701,56 @@ async function botDeepLink(db, token, chatId, phone) {
     testDateStr = dUZT.getDate() + " " + MONTHS[dUZT.getMonth()] + " " + dUZT.getFullYear();
   }
 
-  var msg = formatStudentNotification(
-    name,
-    session,
-    examType,
-    speakTime,
-    mainTime,
-    testDateStr,
-    reg.School || reg.school || "",
-    "✅ <b>Successfully linked!</b>\n\nHi " + escHtml(name) + "! 👋\n\nYour registration details:"
-  );
+  // Build confirmation message
+  var msg = "✅ <b>Successfully linked!</b>\n\n";
+  if (matchedRegs.length === 1) {
+    var reg = matchedRegs[0];
+    var name = reg.Name || reg.name || "Student";
+    msg += "Hi " + escHtml(name) + "! 👋\n\nYour registration details:";
+    var session = String(reg.Session || reg.session || "").replace(/ \(est\.\)$/, "");
+    var examType = reg.ExamType || reg.examtype || "";
+    var speakTime = String(reg.SpeakingTime || "").replace(/ \(est\.\)$/, "");
+    var mainTime = String(reg.MainTime || "").replace(/ \(est\.\)$/, "");
+
+    msg = formatStudentNotification(
+      name,
+      session,
+      examType,
+      speakTime,
+      mainTime,
+      testDateStr,
+      reg.School || reg.school || "",
+      msg
+    );
+  } else {
+    msg += "We found <b>" + matchedRegs.length + "</b> registrations linked to this phone number:\n\n";
+    for (var k = 0; k < matchedRegs.length; k++) {
+      var reg = matchedRegs[k];
+      var name = reg.Name || reg.name || "Student";
+      var session = String(reg.Session || reg.session || "").replace(/ \(est\.\)$/, "");
+      var examType = reg.ExamType || reg.examtype || "";
+      var speakTime = String(reg.SpeakingTime || "").replace(/ \(est\.\)$/, "");
+      var mainTime = String(reg.MainTime || "").replace(/ \(est\.\)$/, "");
+
+      msg += "👤 <b>Student #" + (k + 1) + ": " + escHtml(name) + "</b>\n" +
+        formatStudentNotification(
+          name,
+          session,
+          examType,
+          speakTime,
+          mainTime,
+          testDateStr,
+          reg.School || reg.school || "",
+          ""
+        ) + "\n\n";
+    }
+  }
 
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
-    text: msg,
+    text: msg.trim(),
     parse_mode: "HTML",
-     reply_markup: getReplyKeyboard(chatId) // <-- Add this line!
+    reply_markup: getReplyKeyboard()
   });
 }
 
@@ -663,17 +759,16 @@ async function botStatus(db, token, chatId) {
   var users = await db.get("TelegramUsers", "json");
   if (!users || typeof users !== "object") users = {};
 
-  // Reverse-lookup: find phone for this chatId
-  var phone = null;
+  // Reverse-lookup: find ALL phone numbers linked to this chatId
+  var matchedPhones = [];
   var keys = Object.keys(users);
   for (var i = 0; i < keys.length; i++) {
     if (users[keys[i]] === chatId) {
-      phone = keys[i];
-      break;
+      matchedPhones.push(String(keys[i]).replace(/\D/g, "").slice(-9));
     }
   }
 
-  if (!phone) {
+  if (matchedPhones.length === 0) {
     await sendTelegram(token, "sendMessage", {
       chat_id: chatId,
       text:
@@ -687,35 +782,23 @@ async function botStatus(db, token, chatId) {
   if (!Array.isArray(regs)) regs = [];
   regs = regs.map(correctRegistration);
 
-  var reg = null;
+  var matchedRegs = [];
   for (var j = 0; j < regs.length; j++) {
-    if (
-      String(regs[j].Phone || regs[j].phone || "").replace(/\D/g, "") === phone
-    ) {
-      reg = regs[j];
-      break;
+    var rp = String(regs[j].Phone || regs[j].phone || "").replace(/\D/g, "").slice(-9);
+    if (matchedPhones.includes(rp)) {
+      matchedRegs.push(regs[j]);
     }
   }
 
-  if (!reg) {
+  if (matchedRegs.length === 0) {
     await sendTelegram(token, "sendMessage", {
       chat_id: chatId,
       text:
-        "\u26a0\ufe0f Your phone is linked but no active registration was found.\n" +
+        "⚠️ Your phone is linked but no active registration was found.\n" +
         "Your registration may have been cancelled.",
     });
     return;
   }
-
-  var name = reg.Name || reg.name || "Student";
-  var session = String(reg.Session || reg.session || "").replace(
-    / \(est\.\)$/,
-    "",
-  );
-  var examType = reg.ExamType || reg.examtype || "";
-  var speakTime = String(reg.SpeakingTime || "").replace(/ \(est\.\)$/, "");
-  var mainTime = String(reg.MainTime || "").replace(/ \(est\.\)$/, "");
-  var school = reg.School || reg.school || "";
 
   var settings = await db.get("Settings", "json") || {};
   var testDateStr = "";
@@ -725,27 +808,38 @@ async function botStatus(db, token, chatId) {
     testDateStr = dUZT.getDate() + " " + MONTHS[dUZT.getMonth()] + " " + dUZT.getFullYear();
   }
 
-  var msg = formatStudentNotification(
-    name,
-    session,
-    examType,
-    speakTime,
-    mainTime,
-    testDateStr,
-    school,
-    "📋 <b>Your Registration Status</b>\n\nYour reminders are fully active! ✅\nHere are your current details:"
-  );
+  var msg = "📋 <b>Your Registration Status</b>\n\nYour reminders are fully active! ✅\n\n";
+  for (var k = 0; k < matchedRegs.length; k++) {
+    var reg = matchedRegs[k];
+    var name = reg.Name || reg.name || "Student";
+    var session = String(reg.Session || reg.session || "").replace(/ \(est\.\)$/, "");
+    var examType = reg.ExamType || reg.examtype || "";
+    var speakTime = String(reg.SpeakingTime || "").replace(/ \(est\.\)$/, "");
+    var mainTime = String(reg.MainTime || "").replace(/ \(est\.\)$/, "");
+    var school = reg.School || reg.school || "";
+
+    msg += "👤 <b>" + escHtml(name) + "</b>\n" +
+      formatStudentNotification(
+        name,
+        session,
+        examType,
+        speakTime,
+        mainTime,
+        testDateStr,
+        school,
+        ""
+      ) + "\n\n";
+  }
 
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
-    text: msg,
+    text: msg.trim(),
     parse_mode: "HTML",
     disable_web_page_preview: true,
+    reply_markup: getReplyKeyboard()
   });
 }
 
-
-// /location
 async function botLocation(token, chatId) {
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
@@ -777,19 +871,26 @@ async function botRules(token, chatId) {
 async function botSendNow(db, token, chatId) {
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
-    text: "\u23f3 Sending reminders to all linked students...",
+    text: "⏳ Sending reminders to all linked students concurrently...",
   });
 
   var result = await sendAllReminders(db, token);
 
+  var msg =
+    "✅ <b>Done!</b>\n\n" +
+    "📧 Sent: <b>" + result.sent + "</b>\n" +
+    "❌ Failed: <b>" + result.failed + "</b>\n" +
+    "🔗 Not linked: <b>" + result.unlinked + "</b>";
+
+  if (result.error) {
+    msg += "\n⚠️ " + result.error;
+  }
+
+  msg += "\n\n<i>Note: Manual broadcast uses concurrency to reduce webhook execution times. For extremely large student volumes (>200), relying on the automated daily CRON trigger is recommended to prevent script execution timeouts.</i>";
+
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
-    text:
-      "\u2705 <b>Done!</b>\n\n" +
-      "\ud83d\udce8 Sent: <b>" + result.sent + "</b>\n" +
-      "\u274c Failed: <b>" + result.failed + "</b>\n" +
-      "\ud83d\udd17 Not linked: <b>" + result.unlinked + "</b>" +
-      (result.error ? "\n\u26a0\ufe0f " + result.error : ""),
+    text: msg,
     parse_mode: "HTML",
   });
 }
@@ -806,12 +907,12 @@ async function botStats(db, token, chatId) {
   var totalStudents = regs.length;
   var linked = 0;
   for (var i = 0; i < regs.length; i++) {
-    var ph = String(regs[i].Phone || regs[i].phone || "").replace(/\D/g, "");
+    var ph = String(regs[i].Phone || regs[i].phone || "").replace(/\D/g, "").slice(-9);
     if (users[ph]) linked++;
   }
   var unlinked = totalStudents - linked;
 
- var settings = await db.get("Settings", "json");
+  var settings = await db.get("Settings", "json");
   if (!settings || typeof settings !== "object") settings = {};
   var testDateStr = settings.test_date || null;
   var reminderSent = settings.reminder_sent || "Never";
@@ -826,14 +927,14 @@ async function botStats(db, token, chatId) {
     var d = new Date(testDateStr);
     var dUZT = new Date(d.getTime() + UZT_OFFSET_MS);
     msg +=
-      "\n\n\ud83d\udcc5 Test date: <b>" +
+      "\n\n📅 Test date: <b>" +
       dUZT.getDate() + " " + MONTHS[dUZT.getMonth()] + " " + dUZT.getFullYear() +
       "</b>";
   } else {
-    msg += "\n\n\ud83d\udcc5 Test deadline: <i>Not set</i>";
+    msg += "\n\n📅 Test deadline: <i>Not set</i>";
   }
 
-  msg += "\n\ud83d\udce8 Last reminder: <b>" + reminderSent + "</b>";
+  msg += "\n📧 Last reminder: <b>" + reminderSent + "</b>";
 
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
@@ -855,14 +956,14 @@ async function sendAllReminders(db, token) {
   var settings = await db.get("Settings", "json");
   if (!settings || typeof settings !== "object") settings = {};
 
-var testDateStr = settings.test_date;
+  var testDateStr = settings.test_date;
   if (!testDateStr)
     return { sent: 0, failed: 0, unlinked: 0, error: "No test date set" };
 
   // Format test date for display
   var testDate = new Date(testDateStr);
   var testDateUZT = new Date(testDate.getTime() + UZT_OFFSET_MS);
-  var testDateStr =
+  var formattedTestDateStr =
     testDateUZT.getDate() + " " +
     MONTHS[testDateUZT.getMonth()] + " " +
     testDateUZT.getFullYear();
@@ -876,47 +977,57 @@ var testDateStr = settings.test_date;
 
   var sent = 0, failed = 0, unlinked = 0;
 
-  for (var i = 0; i < regs.length; i++) {
-    var reg = regs[i];
-    var phone = String(reg.Phone || reg.phone || "").replace(/\D/g, "");
-    var cid = users[phone];
-    if (!cid) {
-      unlinked++;
-      continue;
-    }
+  // Process registrations concurrently in chunks of 5
+  const CONCURRENCY = 5;
+  for (let i = 0; i < regs.length; i += CONCURRENCY) {
+    const chunk = regs.slice(i, i + CONCURRENCY);
+    await Promise.all(
+      chunk.map(async (reg) => {
+        var phone = String(reg.Phone || reg.phone || "").replace(/\D/g, "").slice(-9);
+        var cid = users[phone];
+        if (!cid) {
+          unlinked++;
+          return;
+        }
 
-    var name = reg.Name || reg.name || "Student";
-    var session = String(reg.Session || reg.session || "").replace(
-      / \(est\.\)$/,
-      "",
+        var name = reg.Name || reg.name || "Student";
+        var session = String(reg.Session || reg.session || "").replace(
+          / \(est\.\)$/,
+          "",
+        );
+        var examType = reg.ExamType || reg.examtype || "";
+        var speakTime = String(reg.SpeakingTime || "").replace(/ \(est\.\)$/, "");
+        var mainTime = String(reg.MainTime || "").replace(/ \(est\.\)$/, "");
+
+        var msg = formatStudentNotification(
+          name,
+          session,
+          examType,
+          speakTime,
+          mainTime,
+          formattedTestDateStr,
+          reg.School || reg.school || "",
+          "📋 <b>Mock Test Reminder</b>\n\nHello, " + escHtml(name) + "! 👋\n\nYour mock test is <b>TOMORROW</b>.",
+          true
+        );
+
+        try {
+          var res = await sendTelegram(token, "sendMessage", {
+            chat_id: cid,
+            text: msg,
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+          });
+          if (res && res.ok) {
+            sent++;
+          } else {
+            failed++;
+          }
+        } catch (e) {
+          failed++;
+        }
+      })
     );
-    var examType = reg.ExamType || reg.examtype || "";
-    var speakTime = String(reg.SpeakingTime || "").replace(/ \(est\.\)$/, "");
-    var mainTime = String(reg.MainTime || "").replace(/ \(est\.\)$/, "");
-
-    var msg = formatStudentNotification(
-      name,
-      session,
-      examType,
-      speakTime,
-      mainTime,
-      testDateStr,
-      reg.School || reg.school || "",
-      "📋 <b>Mock Test Reminder</b>\n\nHello, " + escHtml(name) + "! 👋\n\nYour mock test is <b>TOMORROW</b>.",
-      true
-    );
-
-    try {
-      await sendTelegram(token, "sendMessage", {
-        chat_id: cid,
-        text: msg,
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-      });
-      sent++;
-    } catch (e) {
-      failed++;
-    }
   }
 
   return { sent: sent, failed: failed, unlinked: unlinked };
@@ -1078,82 +1189,92 @@ async function handleScheduled(env) {
   var token = env.BOT_TOKEN;
   if (!db || !token) return;
 
-  var settings = await db.get("Settings", "json");
-  if (!settings || typeof settings !== "object") settings = {};
+  try {
+    var settings = await db.get("Settings", "json");
+    if (!settings || typeof settings !== "object") settings = {};
 
-  // Look for the actual test date, not the registration deadline
-  var actualTestDateStr = settings.test_date;
-  if (!actualTestDateStr) return; // Admin hasn't set the test date yet
+    // Look for the actual test date, not the registration deadline
+    var actualTestDateStr = settings.test_date;
+    if (!actualTestDateStr) return; // Admin hasn't set the test date yet
 
-  var testDate = new Date(actualTestDateStr);
-  if (isNaN(testDate.getTime())) return;
+    var testDate = new Date(actualTestDateStr);
+    if (isNaN(testDate.getTime())) return;
 
-  // Calculate dates in Uzbekistan time (UTC+5)
-  var now = new Date();
-  var nowUZT = new Date(now.getTime() + UZT_OFFSET_MS);
-  var tomorrowUZT = new Date(nowUZT);
-  tomorrowUZT.setDate(tomorrowUZT.getDate() + 1);
+    // Calculate dates in Uzbekistan time (UTC+5)
+    var now = new Date();
+    var nowUZT = new Date(now.getTime() + UZT_OFFSET_MS);
+    var tomorrowUZT = new Date(nowUZT);
+    tomorrowUZT.setDate(tomorrowUZT.getDate() + 1);
 
-  var testDateUZT = new Date(testDate.getTime() + UZT_OFFSET_MS);
+    var testDateUZT = new Date(testDate.getTime() + UZT_OFFSET_MS);
 
-  // --- NEW: AUTO-CLEANUP LOGIC ---
-  // If today is strictly AFTER the test date, wipe the database
-  var isTestOver = 
-    (nowUZT.getFullYear() > testDateUZT.getFullYear()) ||
-    (nowUZT.getFullYear() === testDateUZT.getFullYear() && nowUZT.getMonth() > testDateUZT.getMonth()) ||
-    (nowUZT.getFullYear() === testDateUZT.getFullYear() && nowUZT.getMonth() === testDateUZT.getMonth() && nowUZT.getDate() > testDateUZT.getDate());
+    // --- NEW: AUTO-CLEANUP LOGIC ---
+    // If today is strictly AFTER the test date, wipe the database
+    var isTestOver = 
+      (nowUZT.getFullYear() > testDateUZT.getFullYear()) ||
+      (nowUZT.getFullYear() === testDateUZT.getFullYear() && nowUZT.getMonth() > testDateUZT.getMonth()) ||
+      (nowUZT.getFullYear() === testDateUZT.getFullYear() && nowUZT.getMonth() === testDateUZT.getMonth() && nowUZT.getDate() > testDateUZT.getDate());
 
- if (isTestOver && settings.cleaned_up !== actualTestDateStr) {
-    // 1. Wipe all students, Telegram links, and release all seats
-    await db.put("Registrations", JSON.stringify([]));
-    await db.put("TelegramUsers", JSON.stringify({}));
-    await db.put("Seats", JSON.stringify({}));
-    
- // 2. Mark this test date as "cleaned up" so it doesn't wipe repeatedly
-    settings.cleaned_up = actualTestDateStr;
+    if (isTestOver && settings.cleaned_up !== actualTestDateStr) {
+      // 1. Wipe all students, Telegram links, and release all seats
+      await db.put("Registrations", JSON.stringify([]));
+      await db.put("TelegramUsers", JSON.stringify({}));
+      await db.put("Seats", JSON.stringify({}));
+      
+      // 2. Mark this test date as "cleaned up" so it doesn't wipe repeatedly
+      settings.cleaned_up = actualTestDateStr;
+      await db.put("Settings", JSON.stringify(settings));
+      
+      // 3. Notify the Admin
+      try {
+        await sendTelegram(token, "sendMessage", {
+          chat_id: ADMIN_TELEGRAM_ID,
+          text: "🧹 <b>Database Auto-Cleaned</b>\n\nThe test day has passed! All registered students and Telegram links have been wiped to prepare for your next test.",
+          parse_mode: "HTML"
+        });
+      } catch(e) {}
+      
+      return; // Exit early, no need to send reminders for an old test
+    }
+
+    // Is tomorrow the test day?
+    var isTomorrow =
+      tomorrowUZT.getFullYear() === testDateUZT.getFullYear() &&
+      tomorrowUZT.getMonth() === testDateUZT.getMonth() &&
+      tomorrowUZT.getDate() === testDateUZT.getDate();
+
+    if (!isTomorrow) return;
+
+    // Already sent today?
+    var todayStr = nowUZT.toISOString().slice(0, 10);
+    if (settings.reminder_sent === todayStr) return;
+
+    // Send reminders to all linked students
+    var result = await sendAllReminders(db, token);
+
+    // Mark as sent to prevent duplicates
+    settings.reminder_sent = todayStr;
     await db.put("Settings", JSON.stringify(settings));
-    
-    // 3. Notify the Admin
+
+    // Notify admin about the automated send
     try {
       await sendTelegram(token, "sendMessage", {
         chat_id: ADMIN_TELEGRAM_ID,
-        text: "🧹 <b>Database Auto-Cleaned</b>\n\nThe test day has passed! All registered students and Telegram links have been wiped to prepare for your next test.",
-        parse_mode: "HTML"
+        text:
+          "🔔 <b>Automated Reminders Sent</b>\n\n" +
+          "📤 Sent: " + result.sent +
+          "\n❌ Failed: " + result.failed +
+          "\n🔗 Not linked: " + result.unlinked,
+        parse_mode: "HTML",
       });
-    } catch(e) {}
-    
-    return; // Exit early, no need to send reminders for an old test
+    } catch (e) {}
+  } catch (cronError) {
+    try {
+      await sendTelegram(token, "sendMessage", {
+        chat_id: ADMIN_TELEGRAM_ID,
+        text: "🚨 <b>CRON Reminder Task Failure Alert</b>\n\nAn unexpected error occurred during the daily automated reminder execution:\n\n<code>" + escHtml(cronError.stack || cronError.message) + "</code>",
+        parse_mode: "HTML",
+      });
+    } catch (e) {}
   }
-
-  // Is tomorrow the test day?
-  var isTomorrow =
-    tomorrowUZT.getFullYear() === testDateUZT.getFullYear() &&
-    tomorrowUZT.getMonth() === testDateUZT.getMonth() &&
-    tomorrowUZT.getDate() === testDateUZT.getDate();
-
-  if (!isTomorrow) return;
-
-  // Already sent today?
-  var todayStr = nowUZT.toISOString().slice(0, 10);
-  if (settings.reminder_sent === todayStr) return;
-
-  // Send reminders to all linked students
-  var result = await sendAllReminders(db, token);
-
-  // Mark as sent to prevent duplicates
-  settings.reminder_sent = todayStr;
-  await db.put("Settings", JSON.stringify(settings));
-
-  // Notify admin about the automated send
-  try {
-    await sendTelegram(token, "sendMessage", {
-      chat_id: ADMIN_TELEGRAM_ID,
-      text:
-        "🔔 <b>Automated Reminders Sent</b>\n\n" +
-        "📤 Sent: " + result.sent +
-        "\n❌ Failed: " + result.failed +
-        "\n🔗 Not linked: " + result.unlinked,
-      parse_mode: "HTML",
-    });
-  } catch (e) {}
 }
