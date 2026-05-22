@@ -254,6 +254,12 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
     let rows = await db.get("Registrations", "json");
     if (!Array.isArray(rows)) rows = [];
 
+    const changed = backfillCandidateNumbers(rows);
+    if (changed) {
+      await db.put("Registrations", JSON.stringify(rows));
+      bgSync(); // Background sync to Google Sheets
+    }
+
     // --- GET: return all registrations instantly ---
     if (method === "GET") {
       // If a search query is provided (e.g. ?Phone=...), filter
@@ -296,6 +302,7 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
           });
         }
       }
+      payload.CandidateNumber = generateUniqueCandidateNumber(rows);
       rows.push(payload);
       rows = rows.map(correctRegistration);
       await db.put("Registrations", JSON.stringify(rows));
@@ -323,7 +330,9 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
               payload.MainTime,
               testDateStr,
               payload.School,
-              "🎉 <b>Registration Successful!</b>\n\nYou have successfully registered for the mock test."
+              "🎉 <b>Registration Successful!</b>\n\nYou have successfully registered for the mock test.",
+              false,
+              payload.CandidateNumber
             );
             await sendTelegram(token, "sendMessage", { chat_id: cid, text: msg, parse_mode: "HTML", disable_web_page_preview: true });
           }
@@ -331,7 +340,7 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
       }
       // ----------------------------------------------------------------------
 
-      return new Response(JSON.stringify({ created: 1 }), {
+      return new Response(JSON.stringify({ created: 1, candidateNumber: payload.CandidateNumber }), {
         status: 201,
         headers: corsHeaders,
       });
@@ -385,7 +394,12 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
           if (rp === cleanPhoneToUpdate) {
             updated++;
             var correctedRow = correctRegistration(r);
-            return Object.assign({}, correctedRow, payload);
+            var merged = Object.assign({}, correctedRow, payload);
+            var oldCN = correctedRow.CandidateNumber || correctedRow.candidatenumber;
+            if (oldCN && !merged.CandidateNumber && !merged.candidatenumber) {
+              merged.CandidateNumber = oldCN;
+            }
+            return merged;
           }
           return correctRegistration(r);
         });
@@ -402,7 +416,7 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
                 const fullReg = rows.find(r => {
                   const rp = String(r.Phone || r.phone || "").replace(/\D/g, "").slice(-9);
                   return rp === cleanPhoneToUpdate;
-                }) || payload;
+                });
                 let settings = await db.get("Settings", "json") || {};
                 let testDateStr = "";
                 if (settings.test_date) {
@@ -418,7 +432,9 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
                   fullReg.MainTime || fullReg.maintime,
                   testDateStr,
                   fullReg.School || fullReg.school,
-                  "🔄 <b>Registration Updated</b>\n\nYour mock test details were successfully updated!"
+                  "🔄 <b>Registration Updated</b>\n\nYour mock test details were successfully updated!",
+                  false,
+                  fullReg.CandidateNumber || fullReg.candidatenumber
                 );
                 await sendTelegram(token, "sendMessage", { chat_id: cid, text: msg, parse_mode: "HTML", disable_web_page_preview: true });
               }
@@ -588,6 +604,9 @@ async function handleBotAsync(update, env) {
     else if (text === "/status" || text.includes("My Status")) {
       await botStatus(db, token, chatId);
     } 
+    else if (text === "/candidate" || text.includes("Candidate Number")) {
+      await botCandidateNumber(db, token, chatId);
+    }
     else if (text === "/location" || text.includes("Location")) {
       await botLocation(token, chatId);
     } 
@@ -623,8 +642,9 @@ async function handleBotAsync(update, env) {
 function getReplyKeyboard() {
   return { 
     keyboard: [
-      [{ text: "📋 My Status" }, { text: "📍 Location" }],
-      [{ text: "⚠️ Test Rules" }, { text: "❓ Help" }]
+      [{ text: "📋 My Status" }, { text: "🆔 Candidate Number" }],
+      [{ text: "📍 Location" }, { text: "⚠️ Test Rules" }],
+      [{ text: "❓ Help" }]
     ],
     resize_keyboard: true, 
     is_persistent: true 
@@ -720,7 +740,9 @@ async function botDeepLink(db, token, chatId, phone) {
       mainTime,
       testDateStr,
       reg.School || reg.school || "",
-      msg
+      msg,
+      false,
+      reg.CandidateNumber || reg.candidatenumber
     );
   } else {
     msg += "We found <b>" + matchedRegs.length + "</b> registrations linked to this phone number:\n\n";
@@ -741,7 +763,9 @@ async function botDeepLink(db, token, chatId, phone) {
           mainTime,
           testDateStr,
           reg.School || reg.school || "",
-          ""
+          "",
+          false,
+          reg.CandidateNumber || reg.candidatenumber
         ) + "\n\n";
     }
   }
@@ -827,7 +851,9 @@ async function botStatus(db, token, chatId) {
         mainTime,
         testDateStr,
         school,
-        ""
+        "",
+        false,
+        reg.CandidateNumber || reg.candidatenumber
       ) + "\n\n";
   }
 
@@ -836,6 +862,68 @@ async function botStatus(db, token, chatId) {
     text: msg.trim(),
     parse_mode: "HTML",
     disable_web_page_preview: true,
+    reply_markup: getReplyKeyboard()
+  });
+}
+
+// /candidate — show candidate numbers of linked students
+async function botCandidateNumber(db, token, chatId) {
+  var users = await db.get("TelegramUsers", "json");
+  if (!users || typeof users !== "object") users = {};
+
+  // Reverse-lookup: find ALL phone numbers linked to this chatId
+  var matchedPhones = [];
+  var keys = Object.keys(users);
+  for (var i = 0; i < keys.length; i++) {
+    if (users[keys[i]] === chatId) {
+      matchedPhones.push(String(keys[i]).replace(/\D/g, "").slice(-9));
+    }
+  }
+
+  if (matchedPhones.length === 0) {
+    await sendTelegram(token, "sendMessage", {
+      chat_id: chatId,
+      text:
+        "You haven't linked your registration yet.\n\n" +
+        'Register at the mock test website and click the "Get Telegram Reminders" link on your success page.',
+    });
+    return;
+  }
+
+  var regs = await db.get("Registrations", "json");
+  if (!Array.isArray(regs)) regs = [];
+  regs = regs.map(correctRegistration);
+
+  var matchedRegs = [];
+  for (var j = 0; j < regs.length; j++) {
+    var rp = String(regs[j].Phone || regs[j].phone || "").replace(/\D/g, "").slice(-9);
+    if (matchedPhones.includes(rp)) {
+      matchedRegs.push(regs[j]);
+    }
+  }
+
+  if (matchedRegs.length === 0) {
+    await sendTelegram(token, "sendMessage", {
+      chat_id: chatId,
+      text:
+        "⚠️ Your phone is linked but no active registration was found.\n" +
+        "Your registration may have been cancelled.",
+    });
+    return;
+  }
+
+  var msg = "🆔 <b>Your Candidate Number(s)</b>\n\nTap to copy:\n\n";
+  for (var k = 0; k < matchedRegs.length; k++) {
+    var reg = matchedRegs[k];
+    var name = reg.Name || reg.name || "Student";
+    var cn = reg.CandidateNumber || reg.candidatenumber || "N/A";
+    msg += "👤 <b>" + escHtml(name) + "</b>: <code>" + escHtml(cn) + "</code>\n";
+  }
+
+  await sendTelegram(token, "sendMessage", {
+    chat_id: chatId,
+    text: msg.trim(),
+    parse_mode: "HTML",
     reply_markup: getReplyKeyboard()
   });
 }
@@ -1008,7 +1096,8 @@ async function sendAllReminders(db, token) {
           formattedTestDateStr,
           reg.School || reg.school || "",
           "📋 <b>Mock Test Reminder</b>\n\nHello, " + escHtml(name) + "! 👋\n\nYour mock test is <b>TOMORROW</b>.",
-          true
+          true,
+          reg.CandidateNumber || reg.candidatenumber
         );
 
         try {
@@ -1067,13 +1156,14 @@ function formatMinutesToHHMM(m) {
   return (h < 10 ? "0" : "") + h + ":" + (n < 10 ? "0" : "") + n;
 }
 
-function formatStudentNotification(name, session, examType, speakTime, mainTime, testDateStr, school, prefixText, isReminder) {
+function formatStudentNotification(name, session, examType, speakTime, mainTime, testDateStr, school, prefixText, isReminder, candidateNumber) {
   var s = String(session || "").replace(/ \(est\.\)$/, "").trim();
   var et = String(examType || "").trim();
   var st = String(speakTime || "").replace(/ \(est\.\)$/, "").trim();
   var mt = String(mainTime || "").replace(/ \(est\.\)$/, "").trim();
 
   var msg = prefixText + "\n\n";
+  if (candidateNumber) msg += "🆔 Candidate No: <code>" + escHtml(candidateNumber) + "</code>\n";
   if (name) msg += "👤 Name: <b>" + escHtml(name) + "</b>\n";
   if (testDateStr) msg += "📅 Date: <b>" + escHtml(testDateStr) + "</b>\n";
   msg += "🕒 Session: <b>" + escHtml(s) + "</b>\n";
@@ -1115,6 +1205,35 @@ function formatStudentNotification(name, session, examType, speakTime, mainTime,
     msg += "\nGood luck! 🍀";
   }
   return msg;
+}
+
+function generateUniqueCandidateNumber(existingRows) {
+  var existingSet = new Set();
+  for (var i = 0; i < existingRows.length; i++) {
+    var val = existingRows[i].CandidateNumber || existingRows[i].candidatenumber;
+    if (val) existingSet.add(String(val));
+  }
+  var attempts = 0;
+  while (attempts < 1000) {
+    var candidateNumber = String(Math.floor(100000 + Math.random() * 900000));
+    if (!existingSet.has(candidateNumber)) {
+      return candidateNumber;
+    }
+    attempts++;
+  }
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function backfillCandidateNumbers(rows) {
+  var changed = false;
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    if (!r.CandidateNumber && !r.candidatenumber) {
+      r.CandidateNumber = generateUniqueCandidateNumber(rows);
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 function parseTimeToMin(timeStr) {
@@ -1203,19 +1322,21 @@ async function handleScheduled(env) {
     // Calculate dates in Uzbekistan time (UTC+5)
     var now = new Date();
     var nowUZT = new Date(now.getTime() + UZT_OFFSET_MS);
-    var tomorrowUZT = new Date(nowUZT);
-    tomorrowUZT.setDate(tomorrowUZT.getDate() + 1);
+    var tomorrowUZT = new Date(nowUZT.getTime() + 24 * 60 * 60 * 1000);
 
     var testDateUZT = new Date(testDate.getTime() + UZT_OFFSET_MS);
 
     // --- NEW: AUTO-CLEANUP LOGIC ---
-    // If today is strictly AFTER the test date, wipe the database
-    var isTestOver = 
-      (nowUZT.getFullYear() > testDateUZT.getFullYear()) ||
-      (nowUZT.getFullYear() === testDateUZT.getFullYear() && nowUZT.getMonth() > testDateUZT.getMonth()) ||
-      (nowUZT.getFullYear() === testDateUZT.getFullYear() && nowUZT.getMonth() === testDateUZT.getMonth() && nowUZT.getDate() > testDateUZT.getDate());
+    // Database cleanup happens 2 days after the actual test date
+    var clearDate = new Date(testDate.getTime() + 2 * 24 * 60 * 60 * 1000);
+    var clearDateUZT = new Date(clearDate.getTime() + UZT_OFFSET_MS);
 
-    if (isTestOver && settings.cleaned_up !== actualTestDateStr) {
+    var isClearDayOrAfter = 
+      (nowUZT.getUTCFullYear() > clearDateUZT.getUTCFullYear()) ||
+      (nowUZT.getUTCFullYear() === clearDateUZT.getUTCFullYear() && nowUZT.getUTCMonth() > clearDateUZT.getUTCMonth()) ||
+      (nowUZT.getUTCFullYear() === clearDateUZT.getUTCFullYear() && nowUZT.getUTCMonth() === clearDateUZT.getUTCMonth() && nowUZT.getUTCDate() >= clearDateUZT.getUTCDate());
+
+    if (isClearDayOrAfter && settings.cleaned_up !== actualTestDateStr) {
       // 1. Wipe all students, Telegram links, and release all seats
       await db.put("Registrations", JSON.stringify([]));
       await db.put("TelegramUsers", JSON.stringify({}));
@@ -1239,9 +1360,9 @@ async function handleScheduled(env) {
 
     // Is tomorrow the test day?
     var isTomorrow =
-      tomorrowUZT.getFullYear() === testDateUZT.getFullYear() &&
-      tomorrowUZT.getMonth() === testDateUZT.getMonth() &&
-      tomorrowUZT.getDate() === testDateUZT.getDate();
+      tomorrowUZT.getUTCFullYear() === testDateUZT.getUTCFullYear() &&
+      tomorrowUZT.getUTCMonth() === testDateUZT.getUTCMonth() &&
+      tomorrowUZT.getUTCDate() === testDateUZT.getUTCDate();
 
     if (!isTomorrow) return;
 

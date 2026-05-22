@@ -302,6 +302,7 @@ async function loadSeats() {
               slotId: matchedSlot ? matchedSlot.id : existing.slotId,
               slotLabel: serverReg.Session || existing.slotLabel,
               school: serverReg.School || serverReg.school || existing.school,
+              candidateNumber: serverReg.CandidateNumber || serverReg.candidatenumber || existing.candidateNumber,
             };
             var serverEt = serverReg.ExamType || serverReg.examtype;
             if (serverEt) {
@@ -346,6 +347,11 @@ async function addRegistration(payload) {
     } catch (e) {}
     if (errObj.error === "DUPLICATE_PHONE") throw new Error("DUPLICATE_PHONE");
     throw new Error("API error " + res.status);
+  }
+  try {
+    return await res.json();
+  } catch (e) {
+    return null;
   }
 }
 
@@ -986,6 +992,9 @@ function renderManage() {
     '<div class="manage-title">You&#39;re registered!</div>' +
     '<div class="manage-sub">Your spot is confirmed. Arrive 10 minutes early with your student ID.</div>' +
     '<div class="booking-card">' +
+    '<div class="booking-row"><span class="booking-row-label">Candidate No.</span><span class="booking-row-val" style="font-weight:700;color:var(--primary)">' +
+    esc(reg.candidateNumber || reg.CandidateNumber || reg.candidatenumber || 'N/A') +
+    '</span></div>' +
     '<div class="booking-row"><span class="booking-row-label">Name</span><span class="booking-row-val">' +
     esc(reg.name) +
     "</span></div>" +
@@ -1552,13 +1561,14 @@ async function submitForm() {
     if (sched && sched.speakTime)
       payload.SpeakingTime = sheetTime(sched.speakTime);
     if (sched && sched.mainTime) payload.MainTime = sheetTime(sched.mainTime);
-    await addRegistration(payload);
+    var respData = await addRegistration(payload);
     var regData = {
       name: form.name.trim(),
       phone: form.phone,
       slotId: form.slot,
       slotLabel: slotInfo.label,
       school: schoolLabel,
+      candidateNumber: (respData && respData.candidateNumber) || payload.CandidateNumber,
     };
     if (et) regData.examType = et;
     if (sched && sched.speakTime) regData.speakTime = sched.speakTime;
@@ -2364,7 +2374,8 @@ function renderAdminPanelHTML() {
         filteredStudents = adminStudents.filter(function (st) {
           var nm = (st.Name || st.name || "").toLowerCase();
           var ph = (st.Phone || st.phone || "").toLowerCase();
-          return nm.indexOf(q) !== -1 || ph.indexOf(q) !== -1;
+          var cn = String(st.CandidateNumber || st.candidatenumber || "").toLowerCase();
+          return nm.indexOf(q) !== -1 || ph.indexOf(q) !== -1 || cn.indexOf(q) !== -1;
         });
       }
       if (filteredStudents.length === 0) {
@@ -2390,7 +2401,7 @@ function renderAdminPanelHTML() {
           return (
             '<div class="session-row" style="padding:12px;justify-content:space-between;align-items:center">' +
             '<div><div style="font-size:14px;font-weight:600;color:#fff;margin-bottom:4px">' +
-            esc(nm) +
+            esc(nm) + ' <span style="font-size:12px;color:var(--primary);font-weight:400">(ID: ' + esc(st.CandidateNumber || st.candidatenumber || "N/A") + ')</span>' +
             "</div>" +
             '<div style="font-size:12px;color:var(--muted)">' +
             esc(ph) +
