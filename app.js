@@ -251,10 +251,79 @@ async function loadSeats() {
     loadErrorMsg = e.message || String(e);
   }
 
-  // If already registered, go to manage screen
+  // If already registered, verify if it is still valid or has been auto-cancelled
   var existing = getRegistration();
   if (existing) {
-    step = 3;
+    var UZT_OFFSET_MS = 5 * 60 * 60 * 1000;
+    var now = new Date();
+    var nowUZT = new Date(now.getTime() + UZT_OFFSET_MS);
+    var isOver = false;
+    if (testDate) {
+      var testDateUZT = new Date(testDate.getTime() + UZT_OFFSET_MS);
+      isOver = (
+        (nowUZT.getFullYear() > testDateUZT.getFullYear()) ||
+        (nowUZT.getFullYear() === testDateUZT.getFullYear() && nowUZT.getMonth() > testDateUZT.getMonth()) ||
+        (nowUZT.getFullYear() === testDateUZT.getFullYear() && nowUZT.getMonth() === testDateUZT.getMonth() && nowUZT.getDate() > testDateUZT.getDate())
+      );
+    }
+    if (isOver) {
+      clearRegistration();
+      existing = null;
+      step = 1;
+    } else {
+      // Test is not over, check if the registration actually exists in the database
+      try {
+        var cleanPhone = existing.phone.replace(/\D/g, "");
+        var verifyPhone = "998" + cleanPhone;
+        var verifyRes = await fetch(
+          API + "/search?sheet=Registrations&Phone=" + encodeURIComponent(verifyPhone)
+        );
+        if (verifyRes.ok) {
+          var verifyRows = await verifyRes.json();
+          if (!Array.isArray(verifyRows) || verifyRows.length === 0) {
+            // Registration not found on server (e.g. database cleared / cleaned up)
+            clearRegistration();
+            existing = null;
+            step = 1;
+          } else {
+            // Update local storage with the latest data from server to keep them in sync
+            var serverReg = verifyRows[0];
+            var matchedSlot = SLOTS.find(function (s) {
+              return s.label === serverReg.Session || sheetTime(s.label) === serverReg.Session;
+            });
+            var updatedRegData = {
+              name: serverReg.Name || serverReg.name || existing.name,
+              phone: existing.phone,
+              slotId: matchedSlot ? matchedSlot.id : existing.slotId,
+              slotLabel: serverReg.Session || existing.slotLabel,
+              school: serverReg.School || serverReg.school || existing.school,
+            };
+            var serverEt = serverReg.ExamType || serverReg.examtype;
+            if (serverEt) {
+              updatedRegData.examType = String(serverEt).toLowerCase() === "speaking" ? "speaking" : "main";
+            } else if (existing.examType) {
+              updatedRegData.examType = existing.examType;
+            }
+            var serverSpeak = serverReg.SpeakingTime || serverReg.speakingtime;
+            if (serverSpeak) updatedRegData.speakTime = serverSpeak;
+            var serverMain = serverReg.MainTime || serverReg.maintime;
+            if (serverMain) updatedRegData.mainTime = serverMain;
+
+            saveRegistration(updatedRegData);
+            existing = updatedRegData;
+            step = 3;
+          }
+        } else {
+          // If server fails (e.g. 500 error), keep local registration as fallback
+          step = 3;
+        }
+      } catch (e) {
+        // Network error, fallback to keeping local registration to be safe when offline
+        step = 3;
+      }
+    }
+  } else {
+    step = 1;
   }
   render();
 }
@@ -1456,7 +1525,11 @@ async function performCancellationLogic(reg) {
   var et3 = reg.examType || null;
   var pid3 = poolId(reg.slotId, et3);
   if (VALID_SLOT_IDS.indexOf(reg.slotId) !== -1) {
-    await restoreOldSeat(pid3);
+    try {
+      await restoreOldSeat(pid3);
+    } catch (e) {
+      console.warn("Could not restore old seat on server cancellation (non-fatal):", e);
+    }
   }
   var cancelledSlotId = reg.slotId;
 
