@@ -39,6 +39,7 @@ var SLOTS = [
 var MAX = 10;
 var seats = { slot_0800: MAX, slot_0940: MAX, slot_1120: MAX, slot_1300: MAX };
 var step = 1; // 1=slot, 5=exam-type, 2=details, 3=manage, 4=change-slot
+var prevStep = null;
 var form = { slot: null, name: "", phone: "", school: "" };
 var errors = {};
 var submitting = false;
@@ -287,7 +288,11 @@ async function loadSeats() {
             step = 1;
           } else {
             // Update local storage with the latest data from server to keep them in sync
-            var serverReg = verifyRows[0];
+            var serverReg = verifyRows.find(function (r) {
+              var rName = String(r.Name || r.name || "").trim().toLowerCase();
+              var eName = String(existing.name || "").trim().toLowerCase();
+              return rName === eName;
+            }) || verifyRows[0];
             var matchedSlot = SLOTS.find(function (s) {
               return s.label === serverReg.Session || sheetTime(s.label) === serverReg.Session;
             });
@@ -637,7 +642,8 @@ function renderStep1() {
     // Full only when all available pools are empty
     var isFull = isMSSession(s.id) ? mainRem <= 0 && spkRem <= 0 : rem === 0;
     var isSel = form.slot === s.id;
-    var cls = ["time-card", isFull ? "full" : "", isSel ? "selected" : "", !hasAnimatedCards ? "animate-in" : ""]
+    var isUrgent = rem <= urgentThreshold && !isFull;
+    var cls = ["time-card", isFull ? "full" : "", isSel ? "selected" : "", !hasAnimatedCards ? "animate-in" : "", isUrgent ? "urgent" : ""]
       .filter(Boolean)
       .join(" ");
     var seatText = isFull
@@ -1007,11 +1013,13 @@ function renderChangeSlot() {
     var isMine = s.id === reg.slotId;
     var isFull = rem === 0 && !isMine;
     var isSel = newSlotChoice === s.id;
+    var isUrgent = rem <= urgentThreshold && !isFull && !isMine;
     var cls = [
       "time-card",
       isFull ? "full" : "",
       isSel ? "selected" : "",
       isMine ? "mine" : "",
+      isUrgent ? "urgent" : "",
     ]
       .filter(Boolean)
       .join(" ");
@@ -1110,7 +1118,10 @@ function render() {
   }
 
   // Wrap in step-view-container for premium view transitions!
-  el.innerHTML = '<div class="step-view-container">' + html + '</div>';
+  var stepChanged = (prevStep !== step);
+  prevStep = step;
+  var containerClass = "step-view-container" + (stepChanged ? " animate-step" : "");
+  el.innerHTML = '<div class="' + containerClass + '">' + html + '</div>';
 
   if (step === 2) {
     attachNameHandler();
@@ -2797,4 +2808,66 @@ window.addEventListener("popstate", function(e) {
   }
 });
 
+function initTheme() {
+  var toggleBtn = document.getElementById("theme-toggle-btn");
+  if (!toggleBtn) return;
+
+  function updateIcon(theme) {
+    if (theme === "dark") {
+      toggleBtn.innerHTML =
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<circle cx="12" cy="12" r="5"></circle>' +
+        '<line x1="12" y1="1" x2="12" y2="3"></line>' +
+        '<line x1="12" y1="21" x2="12" y2="23"></line>' +
+        '<line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>' +
+        '<line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>' +
+        '<line x1="1" y1="12" x2="3" y2="12"></line>' +
+        '<line x1="21" y1="12" x2="23" y2="12"></line>' +
+        '<line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>' +
+        '<line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>' +
+        "</svg>";
+    } else {
+      toggleBtn.innerHTML =
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>' +
+        "</svg>";
+    }
+  }
+
+  function setTheme(theme) {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("theme", theme);
+    updateIcon(theme);
+  }
+
+  // Initial icon update
+  var currentTheme = document.documentElement.getAttribute("data-theme") || "light";
+  updateIcon(currentTheme);
+
+  // Toggle on click
+  toggleBtn.addEventListener("click", function () {
+    var active = document.documentElement.getAttribute("data-theme") || "light";
+    var nextTheme = active === "dark" ? "light" : "dark";
+    setTheme(nextTheme);
+  });
+
+  // Listen to system theme changes (only apply if no user override exists in localStorage)
+  var mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+  if (mediaQuery.addEventListener) {
+    mediaQuery.addEventListener("change", function (e) {
+      if (!localStorage.getItem("theme")) {
+        setTheme(e.matches ? "dark" : "light");
+      }
+    });
+  } else if (mediaQuery.addListener) {
+    // Fallback for older browsers
+    mediaQuery.addListener(function (e) {
+      if (!localStorage.getItem("theme")) {
+        setTheme(e.matches ? "dark" : "light");
+      }
+    });
+  }
+}
+
+initTheme();
 loadSeats();
