@@ -580,6 +580,61 @@ function sheetTime(t) {
 function phonePathSeg(phone) {
   return encodeURIComponent(phone).replace(/%2B/gi, "+");
 }
+// --- Helpers for Daylight Theme ---
+function getDoorsOpenTime(label) {
+  var parts = label.split(":");
+  if (parts.length === 2) {
+    var h = parseInt(parts[0], 10), m = parseInt(parts[1], 10) - 15;
+    if (m < 0) {
+      m += 60;
+      h -= 1;
+    }
+    if (h < 0) {
+      h += 24;
+    }
+    var hStr = h < 10 ? "0" + h : h;
+    var mStr = m < 10 ? "0" + m : m;
+    return "Doors open at " + hStr + ":" + mStr;
+  }
+  return "";
+}
+
+function renderProgressBar(activeStep) {
+  var hasExamStep = (registrationMode === "main_speaking" && form.slot && isMSSession(form.slot));
+  var labels = "";
+  var widthPct = 0;
+  
+  if (hasExamStep) {
+    if (activeStep === 1) {
+      labels = '<span class="current">1 · Session</span><span>2 · Exam</span><span>3 · Details</span>';
+      widthPct = 33;
+    } else if (activeStep === 5) {
+      labels = '<span>1 · Session</span><span class="current">2 · Exam</span><span>3 · Details</span>';
+      widthPct = 66;
+    } else { // activeStep === 2
+      labels = '<span>1 · Session</span><span>2 · Exam</span><span class="current">3 · Details</span>';
+      widthPct = 100;
+    }
+  } else {
+    if (activeStep === 1) {
+      labels = '<span class="current">1 · Session</span><span>2 · Details</span>';
+      widthPct = 50;
+    } else { // activeStep === 2
+      labels = '<span>1 · Session</span><span class="current">2 · Details</span>';
+      widthPct = 100;
+    }
+  }
+  
+  return (
+    '<div class="dl-progress-wrap">' +
+    '<div class="dl-progress-labels">' + labels + '</div>' +
+    '<div class="dl-progress">' +
+    '<div class="dl-progress-fill" style="width:' + widthPct + '%"></div>' +
+    '</div>' +
+    '</div>'
+  );
+}
+
 // --- Render functions ---
 function renderStep1() {
   // Deadline enforcement
@@ -620,14 +675,9 @@ function renderStep1() {
         ")</div>";
     }
   }
-  var dotCount =
-    registrationMode === "main_speaking" && form.slot && isMSSession(form.slot)
-      ? 3
-      : 2;
-  var dots =
-    '<div class="step-indicator"><div class="step-dot active"></div><div class="step-dot"></div>' +
-    (dotCount === 3 ? '<div class="step-dot"></div>' : "") +
-    "</div>";
+  
+  var progressHtml = renderProgressBar(1);
+  
   var cards = SLOTS.map(function (s) {
     var mainRem = seats[s.id] !== undefined ? Number(seats[s.id]) : 0;
     var spkRem =
@@ -638,7 +688,6 @@ function renderStep1() {
     var rem = isMSSession(s.id) ? (mainRem > 0 ? mainRem : spkRem) : mainRem;
     var slotMax = getMaxSeats(s.id);
     var urgentThreshold = Math.max(1, Math.ceil(slotMax * 0.2));
-    var pct = Math.round((rem / slotMax) * 100);
     // Full only when all available pools are empty
     var isFull = isMSSession(s.id) ? mainRem <= 0 && spkRem <= 0 : rem === 0;
     var isSel = form.slot === s.id;
@@ -646,15 +695,29 @@ function renderStep1() {
     var cls = ["time-card", isFull ? "full" : "", isSel ? "selected" : "", !hasAnimatedCards ? "animate-in" : "", isUrgent ? "urgent" : ""]
       .filter(Boolean)
       .join(" ");
-    var seatText = isFull
-      ? '<span class="seats-text full-text">Full</span>'
-      : rem <= urgentThreshold
-        ? '<span class="seats-text urgent">' +
-          rem +
-          " seat" +
-          (rem === 1 ? "" : "s") +
-          " left</span>"
-        : '<span class="seats-text">' + rem + " / " + slotMax + " seats</span>";
+      
+    // Doors open time (15 mins before label)
+    var doorsTimeStr = getDoorsOpenTime(s.label);
+    
+    // Badge styling and text
+    var badgeClass = "time-card-badge";
+    var badgeText = s.period;
+    if (isFull) {
+      badgeClass += " full";
+      badgeText = "Full";
+    } else if (isUrgent) {
+      badgeClass += " urgent";
+      badgeText = "Almost full";
+    }
+    
+    var badgeHtml = '<span class="' + badgeClass + '">' + badgeText + '</span>';
+    
+    // Count html text
+    var countHtml = isFull 
+      ? '<strong>0</strong> / ' + slotMax + ' seats'
+      : '<strong>' + rem + '</strong> / ' + slotMax + ' seats';
+      
+    // Capsule segments dots (taken dots are filled/taken, avail are empty/avail)
     var dotHtml = Array.from({ length: slotMax }, function (_, i) {
       return (
         '<div class="seat-dot ' +
@@ -662,28 +725,27 @@ function renderStep1() {
         '"></div>'
       );
     }).join("");
+    
     var onclick = isFull ? "" : "onclick=\"selectSlot('" + s.id + "')\"";
+    
     return (
-      '<div class="' +
-      cls +
-      '" ' +
-      onclick +
-      ">" +
-      '<div class="time-label">' +
-      s.label +
-      "</div>" +
-      '<div class="seats-row">' +
-      seatText +
-      '<div class="seat-bar-bg"><div class="seat-bar-fill" style="width:' +
-      pct +
-      "%;background:" +
-      barColor(rem, slotMax) +
-      '"></div></div></div>' +
-      '<div class="seat-dots">' +
-      dotHtml +
-      "</div></div>"
+      '<div class="' + cls + '" ' + onclick + '>' +
+      '<span class="time-card-radio"></span>' +
+      '<div class="time-card-content">' +
+      '<div class="time-card-title-row">' +
+      '<div class="time-label">' + s.label + '</div>' +
+      badgeHtml +
+      '</div>' +
+      '<div class="time-card-period">' + doorsTimeStr + '</div>' +
+      '</div>' +
+      '<div class="time-card-meter">' +
+      '<div class="time-card-count">' + countHtml + '</div>' +
+      '<div class="seat-dots">' + dotHtml + '</div>' +
+      '</div>' +
+      '</div>'
     );
   }).join("");
+  
   var canNext =
     form.slot &&
     (isMSSession(form.slot)
@@ -692,14 +754,17 @@ function renderStep1() {
   return (
     countdownHtml +
     errBanner +
-    dots +
+    progressHtml +
     '<div class="section-label">Select test session</div>' +
     '<div class="time-grid">' +
     cards +
     "</div>" +
     '<button class="btn-primary" onclick="goNext()" ' +
     (canNext ? "" : "disabled") +
-    ">Continue</button>" +
+    ">" +
+    "Continue" +
+    '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" style="margin-left: 8px; vertical-align: middle;"><path d="M1 7h12m0 0L8 2m5 5l-5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+    "</button>" +
     (errors.slot
       ? '<div class="error-msg" style="text-align:center;margin-top:8px">' +
         errors.slot +
@@ -766,10 +831,9 @@ function renderExamType() {
     sLabel(sr, sm2, sut, "ss") +
     "</div>";
   var canCont = examType && (examType === "main" ? mr > 0 : sr > 0);
-  var dots3 =
-    '<div class="step-indicator"><div class="step-dot done"></div><div class="step-dot active"></div><div class="step-dot"></div></div>';
+  var progressHtml = renderProgressBar(5);
   return (
-    dots3 +
+    progressHtml +
     '<div class="section-label">Choose exam type — ' +
     esc(si.label) +
     "</div>" +
@@ -844,14 +908,11 @@ function renderStep2() {
         "</div></div>";
     }
   }
-  var isMS2 = registrationMode === "main_speaking" && slotInfo.speakingEnabled;
-  var dots = isMS2
-    ? '<div class="step-indicator"><div class="step-dot done"></div><div class="step-dot done"></div><div class="step-dot active"></div></div>'
-    : '<div class="step-indicator"><div class="step-dot done"></div><div class="step-dot active"></div></div>';
+  var progressHtml = renderProgressBar(2);
   var ajSel = form.school === "adam_johns";
   var otSel = form.school === "other";
   return (
-    dots +
+    progressHtml +
     '<div class="selected-slot-recap"><div>' +
     '<div style="font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:3px">Selected session</div>' +
     '<div class="recap-time">' +
@@ -1023,21 +1084,34 @@ function renderChangeSlot() {
     ]
       .filter(Boolean)
       .join(" ");
-    var seatText = isMine
-      ? '<span class="seats-text mine-text">Your current slot</span>'
+
+    // Doors open time (15 mins before label)
+    var doorsTimeStr = getDoorsOpenTime(s.label);
+
+    // Badge styling and text
+    var badgeClass = "time-card-badge";
+    var badgeText = s.period;
+    if (isMine) {
+      badgeClass += " mine";
+      badgeText = "Your current slot";
+    } else if (isFull) {
+      badgeClass += " full";
+      badgeText = "Full";
+    } else if (isUrgent) {
+      badgeClass += " urgent";
+      badgeText = "Almost full";
+    }
+    
+    var badgeHtml = '<span class="' + badgeClass + '">' + badgeText + '</span>';
+
+    // Count html text
+    var countHtml = isMine
+      ? '<strong>' + rem + '</strong> / ' + slotMax + ' seats'
       : isFull
-        ? '<span class="seats-text full-text">Full</span>'
-        : rem <= urgentThreshold
-          ? '<span class="seats-text urgent">' +
-            rem +
-            " seat" +
-            (rem === 1 ? "" : "s") +
-            " left</span>"
-          : '<span class="seats-text">' +
-            rem +
-            " / " +
-            slotMax +
-            " seats</span>";
+        ? '<strong>0</strong> / ' + slotMax + ' seats'
+        : '<strong>' + rem + '</strong> / ' + slotMax + ' seats';
+
+    // Capsule segments dots (taken dots are filled/taken, avail are empty/avail)
     var dotHtml = Array.from({ length: slotMax }, function (_, i) {
       return (
         '<div class="seat-dot ' +
@@ -1045,27 +1119,25 @@ function renderChangeSlot() {
         '"></div>'
       );
     }).join("");
+
     var onclick =
       isFull || isMine ? "" : "onclick=\"selectNewSlot('" + s.id + "')\"";
+
     return (
-      '<div class="' +
-      cls +
-      '" ' +
-      onclick +
-      ">" +
-      '<div class="time-label">' +
-      s.label +
-      "</div>" +
-      '<div class="seats-row">' +
-      seatText +
-      '<div class="seat-bar-bg"><div class="seat-bar-fill" style="width:' +
-      Math.round((rem / slotMax) * 100) +
-      "%;background:" +
-      barColor(rem, slotMax) +
-      '"></div></div></div>' +
-      '<div class="seat-dots">' +
-      dotHtml +
-      "</div></div>"
+      '<div class="' + cls + '" ' + onclick + '>' +
+      '<span class="time-card-radio"></span>' +
+      '<div class="time-card-content">' +
+      '<div class="time-card-title-row">' +
+      '<div class="time-label">' + s.label + '</div>' +
+      badgeHtml +
+      '</div>' +
+      '<div class="time-card-period">' + doorsTimeStr + '</div>' +
+      '</div>' +
+      '<div class="time-card-meter">' +
+      '<div class="time-card-count">' + countHtml + '</div>' +
+      '<div class="seat-dots">' + dotHtml + '</div>' +
+      '</div>' +
+      '</div>'
     );
   }).join("");
   var et4c = reg.examType || null;
