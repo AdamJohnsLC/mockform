@@ -5,7 +5,7 @@ const APP_SCRIPT_URL =
   "https://script.google.com/macros/s/AKfycbxbeKZKTqZzMacAtntjE1zlgO3iJXAcnIYdjghNm0FqPg8n4a1iXS3P_AuiNWN5hT3g/exec";
 
 const ALLOWED_PATH =
-  /^(\/?|\/search|\/Slot\/[^/?]+|\/Phone\/[^/?]+|\/Key\/[^/?]+)(\?.*)?$/;
+  /^(\/?|\/search|\/Slot\/[^/?]+|\/Phone\/[^/?]+|\/Key\/[^/?]+|\/admin\/.+)(\?.*)?$/;
 const EXPECTED_ADMIN_HASH =
   "4e00966f7d1e666e33b9f63bfad60646e023890a664d10a2e9df11331c46d976";
 
@@ -55,7 +55,7 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(handleScheduled(env));
+    ctx.waitUntil(handleScheduled(env, ctx));
   },
 };
 
@@ -80,8 +80,9 @@ async function handleApi(request, env, url, ctx) {
   const isSettingsMod = subPath.startsWith("/Key/") && request.method !== "GET";
   const isSeatsAdd = request.method === "POST" && qsParams.sheet === "Seats";
   const isSeatsDel = request.method === "DELETE" && qsParams.sheet === "Seats";
+  const isAdminRoute = subPath.startsWith("/admin/");
 
-  if (isSettingsMod || isSeatsAdd || isSeatsDel) {
+  if (isSettingsMod || isSeatsAdd || isSeatsDel || isAdminRoute) {
     const providedHash = request.headers.get("x-admin-hash");
     if (providedHash !== EXPECTED_ADMIN_HASH) {
       return new Response(
@@ -95,6 +96,13 @@ async function handleApi(request, env, url, ctx) {
         },
       );
     }
+  }
+
+  // ----------------------------------------------------------
+  // ADMIN ROUTES — bot stats, broadcast, retry, preview
+  // ----------------------------------------------------------
+  if (isAdminRoute) {
+    return handleAdminRoute(request, env, url, subPath, qsParams, ctx);
   }
 
   // Extract body for POST/PUT/PATCH
@@ -302,6 +310,18 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
           });
         }
       }
+      // --- Authoritative scheduling validation (Main + Speaking) ---
+      try {
+        const conflict = await validateScheduling(db, rows, payload);
+        if (conflict) {
+          return new Response(JSON.stringify({ error: conflict }), {
+            status: 409,
+            headers: corsHeaders,
+          });
+        }
+      } catch (vErr) {
+        console.warn("Scheduling validation skipped (non-fatal):", vErr);
+      }
       payload.CandidateNumber = generateUniqueCandidateNumber(rows);
       rows.push(payload);
       rows = rows.map(correctRegistration);
@@ -322,6 +342,7 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
               var dUZT = new Date(d.getTime() + UZT_OFFSET_MS);
               testDateStr = dUZT.getDate() + " " + MONTHS[dUZT.getMonth()] + " " + dUZT.getFullYear();
             }
+            const botTexts = await loadBotTexts(db);
             let msg = formatStudentNotification(
               payload.Name,
               payload.Session,
@@ -330,9 +351,10 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
               payload.MainTime,
               testDateStr,
               payload.School,
-              "🎉 <b>Registration Successful!</b>\n\nYou have successfully registered for the mock test.",
+              botTexts.bot_text_registration_success_prefix,
               false,
-              payload.CandidateNumber
+              payload.CandidateNumber,
+              botTexts
             );
             await sendTelegram(token, "sendMessage", { chat_id: cid, text: msg, parse_mode: "HTML", disable_web_page_preview: true });
           }
@@ -359,9 +381,10 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
             const users = await db.get("TelegramUsers", "json") || {};
             const cid = users[cleanPhoneToDel];
             if (cid) {
+              const cancelTexts = await loadBotTexts(db);
               await sendTelegram(token, "sendMessage", {
                 chat_id: cid,
-                text: "❌ <b>Registration Cancelled</b>\n\nYour mock test registration has been successfully cancelled. If this was a mistake, please register again on the website.",
+                text: cancelTexts.bot_text_cancellation,
                 parse_mode: "HTML"
               });
             }
@@ -424,6 +447,7 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
                   var dUZT = new Date(d.getTime() + UZT_OFFSET_MS);
                   testDateStr = dUZT.getDate() + " " + MONTHS[dUZT.getMonth()] + " " + dUZT.getFullYear();
                 }
+                const botTexts = await loadBotTexts(db);
                 let msg = formatStudentNotification(
                   fullReg.Name || fullReg.name,
                   fullReg.Session || fullReg.session,
@@ -432,9 +456,10 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
                   fullReg.MainTime || fullReg.maintime,
                   testDateStr,
                   fullReg.School || fullReg.school,
-                  "🔄 <b>Registration Updated</b>\n\nYour mock test details were successfully updated!",
+                  botTexts.bot_text_registration_updated_prefix,
                   false,
-                  fullReg.CandidateNumber || fullReg.candidatenumber
+                  fullReg.CandidateNumber || fullReg.candidatenumber,
+                  botTexts
                 );
                 await sendTelegram(token, "sendMessage", { chat_id: cid, text: msg, parse_mode: "HTML", disable_web_page_preview: true });
               }
@@ -597,25 +622,25 @@ async function handleBotAsync(update, env) {
       if (payload) {
         await botDeepLink(db, token, chatId, payload);
       } else {
-        await botWelcome(token, chatId);
+        await botWelcome(db, token, chatId);
       }
-    } 
+    }
     // Ignore invisible emoji characters
     else if (text === "/status" || text.includes("My Status")) {
       await botStatus(db, token, chatId);
-    } 
+    }
     else if (text === "/candidate" || text.includes("Candidate Number")) {
       await botCandidateNumber(db, token, chatId);
     }
     else if (text === "/location" || text.includes("Location")) {
-      await botLocation(token, chatId);
-    } 
+      await botLocation(db, token, chatId);
+    }
     else if (text === "/rules" || text.includes("Test Rules")) {
-      await botRules(token, chatId);
-    } 
+      await botRules(db, token, chatId);
+    }
     else if (text === "/help" || text.includes("Help")) {
-      await botHelp(token, chatId);
-    } 
+      await botHelp(db, token, chatId);
+    }
     // Hidden Admin Commands (Type these manually to use them!)
     else if (text === "/send_now" && userId === ADMIN_TELEGRAM_ID) {
       await botSendNow(db, token, chatId);
@@ -652,23 +677,22 @@ function getReplyKeyboard() {
 }
 
 // /start (no payload) — welcome message
-async function botWelcome(token, chatId) {
+async function botWelcome(db, token, chatId) {
+  var texts = await loadBotTexts(db);
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
-    text:
-      "👋 <b>Welcome to the Mock Test Reminder Bot!</b>\n\n" +
-      "To receive reminders, register on the website and click the Telegram link on the success page.\n\n" +
-      "👇 <b>Use the keyboard below to manage your registration:</b>",
+    text: texts.bot_text_welcome,
     parse_mode: "HTML",
     reply_markup: getReplyKeyboard(chatId)
   });
 }
 
 // /help
-async function botHelp(token, chatId) {
+async function botHelp(db, token, chatId) {
+  var texts = await loadBotTexts(db);
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
-    text: "Here is what I can do! Tap a button on your keyboard below:",
+    text: texts.bot_text_help,
     reply_markup: getReplyKeyboard(chatId)
   });
 }
@@ -721,6 +745,7 @@ async function botDeepLink(db, token, chatId, phone) {
     testDateStr = dUZT.getDate() + " " + MONTHS[dUZT.getMonth()] + " " + dUZT.getFullYear();
   }
 
+  var botTexts = await loadBotTexts(db);
   // Build confirmation message
   var msg = "✅ <b>Successfully linked!</b>\n\n";
   if (matchedRegs.length === 1) {
@@ -742,7 +767,8 @@ async function botDeepLink(db, token, chatId, phone) {
       reg.School || reg.school || "",
       msg,
       false,
-      reg.CandidateNumber || reg.candidatenumber
+      reg.CandidateNumber || reg.candidatenumber,
+      botTexts
     );
   } else {
     msg += "We found <b>" + matchedRegs.length + "</b> registrations linked to this phone number:\n\n";
@@ -765,7 +791,8 @@ async function botDeepLink(db, token, chatId, phone) {
           reg.School || reg.school || "",
           "",
           false,
-          reg.CandidateNumber || reg.candidatenumber
+          reg.CandidateNumber || reg.candidatenumber,
+          botTexts
         ) + "\n\n";
     }
   }
@@ -832,6 +859,7 @@ async function botStatus(db, token, chatId) {
     testDateStr = dUZT.getDate() + " " + MONTHS[dUZT.getMonth()] + " " + dUZT.getFullYear();
   }
 
+  var botTexts = await loadBotTexts(db);
   var msg = "📋 <b>Your Registration Status</b>\n\nYour reminders are fully active! ✅\n\n";
   for (var k = 0; k < matchedRegs.length; k++) {
     var reg = matchedRegs[k];
@@ -853,7 +881,8 @@ async function botStatus(db, token, chatId) {
         school,
         "",
         false,
-        reg.CandidateNumber || reg.candidatenumber
+        reg.CandidateNumber || reg.candidatenumber,
+        botTexts
       ) + "\n\n";
   }
 
@@ -928,29 +957,22 @@ async function botCandidateNumber(db, token, chatId) {
   });
 }
 
-async function botLocation(token, chatId) {
+async function botLocation(db, token, chatId) {
+  var texts = await loadBotTexts(db);
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
-    text:
-      "📍 <b>Test Center Location</b>\n\n" +
-      "We are located at: <b>Ishonch building</b>\n" +
-      "🗺️ <a href='https://maps.app.goo.gl/Bm5eUVXhBvFfSSDy9'>Open in Google Maps</a>\n\n" +
-      "<i>Please arrive 10-15 minutes before your scheduled time.</i>",
+    text: texts.bot_text_location,
     parse_mode: "HTML",
     disable_web_page_preview: false
   });
 }
 
 // /rules
-async function botRules(token, chatId) {
+async function botRules(db, token, chatId) {
+  var texts = await loadBotTexts(db);
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
-    text:
-      "⚠️ <b>Test Day Rules</b>\n\n" +
-      "1️⃣ <b>Bring A sheet of Paper:</b> Bring a clean paper to write your notes\n" +
-      "2️⃣ <b>Pencils/Pens:</b> Bring your own pen or pencil.\n" +
-      "3️⃣ <b>No Phones:</b> Phones and smartwatches must be set to mute or turned off and handed in.\n" +
-      "4️⃣ <b>Late Policy:</b> If you are more than 15 minutes late, you will not be allowed to enter and lose your seat.",
+    text: texts.bot_text_rules,
     parse_mode: "HTML"
   });
 }
@@ -1062,6 +1084,7 @@ async function sendAllReminders(db, token) {
 
   var users = await db.get("TelegramUsers", "json");
   if (!users || typeof users !== "object") users = {};
+  var botTexts = await loadBotTexts(db);
 
   var sent = 0, failed = 0, unlinked = 0;
 
@@ -1087,6 +1110,11 @@ async function sendAllReminders(db, token) {
         var speakTime = String(reg.SpeakingTime || "").replace(/ \(est\.\)$/, "");
         var mainTime = String(reg.MainTime || "").replace(/ \(est\.\)$/, "");
 
+        // Template variables — only {name} is supported on the reminder header.
+        var header = applyBotVars(botTexts.bot_text_reminder_header_template, {
+          name: escHtml(name),
+        });
+
         var msg = formatStudentNotification(
           name,
           session,
@@ -1095,9 +1123,10 @@ async function sendAllReminders(db, token) {
           mainTime,
           formattedTestDateStr,
           reg.School || reg.school || "",
-          "📋 <b>Mock Test Reminder</b>\n\nHello, " + escHtml(name) + "! 👋\n\nYour mock test is <b>TOMORROW</b>.",
+          header,
           true,
-          reg.CandidateNumber || reg.candidatenumber
+          reg.CandidateNumber || reg.candidatenumber,
+          botTexts
         );
 
         try {
@@ -1156,11 +1185,80 @@ function formatMinutesToHHMM(m) {
   return (h < 10 ? "0" : "") + h + ":" + (n < 10 ? "0" : "") + n;
 }
 
-function formatStudentNotification(name, session, examType, speakTime, mainTime, testDateStr, school, prefixText, isReminder, candidateNumber) {
+// ----------------------------------------------------------
+// BOT TEXT TEMPLATES (admin-editable via Settings sheet)
+// ----------------------------------------------------------
+// Every key has a hardcoded fallback so the bot keeps working
+// when nothing is configured. Admins edit values via the
+// admin Bot tab → PATCH /api/Key/bot_text_* (X-Admin-Hash).
+
+const DEFAULT_BOT_TEXTS = {
+  bot_text_welcome:
+    "👋 <b>Welcome to the Mock Test Reminder Bot!</b>\n\n" +
+    "To receive reminders, register on the website and click the Telegram link on the success page.\n\n" +
+    "👇 <b>Use the keyboard below to manage your registration:</b>",
+  bot_text_help: "Here is what I can do! Tap a button on your keyboard below:",
+  bot_text_rules:
+    "⚠️ <b>Test Day Rules</b>\n\n" +
+    "1️⃣ <b>Bring A sheet of Paper:</b> Bring a clean paper to write your notes\n" +
+    "2️⃣ <b>Pencils/Pens:</b> Bring your own pen or pencil.\n" +
+    "3️⃣ <b>No Phones:</b> Phones and smartwatches must be set to mute or turned off and handed in.\n" +
+    "4️⃣ <b>Late Policy:</b> If you are more than 15 minutes late, you will not be allowed to enter and lose your seat.",
+  bot_text_location:
+    "📍 <b>Test Center Location</b>\n\n" +
+    "We are located at: <b>Ishonch building</b>\n" +
+    "🗺️ <a href='https://maps.app.goo.gl/Bm5eUVXhBvFfSSDy9'>Open in Google Maps</a>\n\n" +
+    "<i>Please arrive 10-15 minutes before your scheduled time.</i>",
+  // The next two are embedded inside formatStudentNotification — they MUST be
+  // single-line HTML to keep the message layout tidy.
+  bot_text_location_line:
+    "📍 Location: <b>Ishonch building</b> (<a href=\"https://maps.app.goo.gl/Bm5eUVXhBvFfSSDy9\">Open in Google Maps</a>)",
+  bot_text_registration_success_prefix:
+    "🎉 <b>Registration Successful!</b>\n\nYou have successfully registered for the mock test.",
+  bot_text_registration_updated_prefix:
+    "🔄 <b>Registration Updated</b>\n\nYour mock test details were successfully updated!",
+  bot_text_cancellation:
+    "❌ <b>Registration Cancelled</b>\n\nYour mock test registration has been successfully cancelled. If this was a mistake, please register again on the website.",
+  bot_text_reminder_header_template:
+    "📋 <b>Mock Test Reminder</b>\n\nHello, {name}! 👋\n\nYour mock test is <b>TOMORROW</b>.",
+  bot_text_reminder_tips:
+    "💡 <b>Important Tips:</b>\n" +
+    "• Arrive 10 minutes early with a pen/pencil and paper.\n" +
+    "{alarm}" +
+    "\nGood luck! 🍀",
+};
+
+// Read admin overrides from Settings, fall back to defaults. Returns a flat object.
+// Safe to call repeatedly — Settings is a single KV blob.
+async function loadBotTexts(db) {
+  let settings = {};
+  try {
+    settings = (await db.get("Settings", "json")) || {};
+  } catch (e) {}
+  const out = {};
+  for (const k of Object.keys(DEFAULT_BOT_TEXTS)) {
+    const v = settings[k];
+    out[k] = typeof v === "string" && v.length > 0 ? v : DEFAULT_BOT_TEXTS[k];
+  }
+  return out;
+}
+
+// Substitute simple {placeholder} tokens. Used for reminder header (carries {name}).
+function applyBotVars(template, vars) {
+  if (!template) return "";
+  return String(template).replace(/\{(\w+)\}/g, function (_, k) {
+    return Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : "";
+  });
+}
+
+function formatStudentNotification(name, session, examType, speakTime, mainTime, testDateStr, school, prefixText, isReminder, candidateNumber, botTexts) {
   var s = String(session || "").replace(/ \(est\.\)$/, "").trim();
   var et = String(examType || "").trim();
   var st = String(speakTime || "").replace(/ \(est\.\)$/, "").trim();
   var mt = String(mainTime || "").replace(/ \(est\.\)$/, "").trim();
+
+  var texts = botTexts || DEFAULT_BOT_TEXTS;
+  var locationLine = texts.bot_text_location_line || DEFAULT_BOT_TEXTS.bot_text_location_line;
 
   var msg = prefixText + "\n\n";
   if (candidateNumber) msg += "🆔 Candidate No: <code>" + escHtml(candidateNumber) + "</code>\n";
@@ -1169,13 +1267,13 @@ function formatStudentNotification(name, session, examType, speakTime, mainTime,
   msg += "🕒 Session: <b>" + escHtml(s) + "</b>\n";
 
   var sessionMin = getSessionMinutes(s);
-  
+
   if (et.toLowerCase() === "speaking") {
     msg += "📝 Exam Type: <b>Speaking First</b> (Speaking before main exam)\n";
     if (st) msg += "🎤 Speaking First: <b>" + escHtml(st) + "</b>\n";
     if (mt) msg += "📋 Main Exam: <b>" + escHtml(mt) + "</b>\n";
-    msg += "\n📍 Location: <b>Ishonch building</b> (<a href=\"https://maps.app.goo.gl/Bm5eUVXhBvFfSSDy9\">Open in Google Maps</a>)\n";
-    
+    msg += "\n" + locationLine + "\n";
+
     if (!isNaN(sessionMin)) {
       var mainStart = formatMinutesToHHMM(sessionMin + 160);
       var speakEnd = formatMinutesToHHMM(sessionMin + 150);
@@ -1184,8 +1282,8 @@ function formatStudentNotification(name, session, examType, speakTime, mainTime,
   } else {
     msg += "📝 Exam Type: <b>Main First</b> (Listening, Reading, Writing first)\n";
     if (st) msg += "🎤 Speaking Time: <b>" + escHtml(st) + "</b>\n";
-    msg += "\n📍 Location: <b>Ishonch building</b> (<a href=\"https://maps.app.goo.gl/Bm5eUVXhBvFfSSDy9\">Open in Google Maps</a>)\n";
-    
+    msg += "\n" + locationLine + "\n";
+
     if (!isNaN(sessionMin)) {
       var mainEnd = formatMinutesToHHMM(sessionMin + 150);
       var firstSpeak = formatMinutesToHHMM(sessionMin + 160);
@@ -1196,15 +1294,334 @@ function formatStudentNotification(name, session, examType, speakTime, mainTime,
   if (school) msg += "\n🏫 School: " + escHtml(school);
 
   if (isReminder) {
-    msg += "\n\n💡 <b>Important Tips:</b>\n" +
-           "• Arrive 10 minutes early with a pen/pencil and paper.\n";
+    var alarmLine = "";
     var alarm = suggestAlarm(s);
-    if (alarm) {
-      msg += "• Set an alarm for <b>" + alarm + "</b> so you don't miss it!\n";
-    }
-    msg += "\nGood luck! 🍀";
+    if (alarm) alarmLine = "• Set an alarm for <b>" + alarm + "</b> so you don't miss it!\n";
+    msg += "\n\n" + applyBotVars(texts.bot_text_reminder_tips, { alarm: alarmLine });
   }
   return msg;
+}
+
+// ============================================================
+// ADMIN ROUTES — /api/admin/*
+// All routes are gated by the X-Admin-Hash check in handleApi.
+// ============================================================
+
+async function handleAdminRoute(request, env, url, subPath, qsParams, ctx) {
+  const db = env.MOCK_DB;
+  const token = env.BOT_TOKEN;
+  const corsHeaders = {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+  };
+  if (!db) {
+    return new Response(JSON.stringify({ error: "DB not bound" }), {
+      status: 500,
+      headers: corsHeaders,
+    });
+  }
+  const method = request.method;
+  let body = null;
+  if (["POST", "PATCH"].includes(method)) {
+    try {
+      body = await request.clone().json();
+    } catch (e) {}
+  }
+
+  // GET /api/admin/bot-stats
+  if (subPath === "/admin/bot-stats" && method === "GET") {
+    return jsonResp(await computeBotStats(db), 200);
+  }
+
+  // GET /api/admin/broadcast-preview-count?audience=...
+  if (subPath === "/admin/broadcast-preview-count" && method === "GET") {
+    let audience;
+    try {
+      audience = qsParams.audience ? JSON.parse(qsParams.audience) : "all_linked";
+    } catch (e) {
+      audience = "all_linked";
+    }
+    const recipients = await resolveAudience(audience, db);
+    return jsonResp({ count: recipients.length }, 200);
+  }
+
+  // POST /api/admin/broadcast — create + start
+  if (subPath === "/admin/broadcast" && method === "POST") {
+    if (!body || !body.text) return jsonResp({ error: "text required" }, 400);
+    const text = String(body.text).slice(0, 4000); // Telegram message limit
+    const audience = body.audience || "all_linked";
+    const recipients = await resolveAudience(audience, db);
+    const id = "b" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const record = {
+      id,
+      createdAt: new Date().toISOString(),
+      status: recipients.length === 0 ? "done" : "queued",
+      text,
+      audience,
+      recipients,
+      cursor: 0,
+      sent: [],
+      failed: [],
+      startedAt: null,
+      finishedAt: recipients.length === 0 ? new Date().toISOString() : null,
+    };
+    await db.put("broadcast:" + id, JSON.stringify(record));
+    await appendBroadcastIndex(db, id);
+    if (recipients.length > 0) {
+      ctx.waitUntil(processBroadcast(id, env));
+    }
+    return jsonResp({ id, recipients: recipients.length }, 201);
+  }
+
+  // POST /api/admin/broadcast/preview — DM the admin only
+  if (subPath === "/admin/broadcast/preview" && method === "POST") {
+    if (!body || !body.text) return jsonResp({ error: "text required" }, 400);
+    if (!token) return jsonResp({ error: "Bot token not configured" }, 500);
+    try {
+      const res = await sendTelegram(token, "sendMessage", {
+        chat_id: ADMIN_TELEGRAM_ID,
+        text: String(body.text).slice(0, 4000),
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+      return jsonResp({ ok: !!(res && res.ok), telegramResponse: res }, 200);
+    } catch (e) {
+      return jsonResp({ ok: false, error: e.message }, 500);
+    }
+  }
+
+  // GET /api/admin/broadcast/:id
+  const getMatch = subPath.match(/^\/admin\/broadcast\/([A-Za-z0-9]+)$/);
+  if (getMatch && method === "GET") {
+    const rec = await db.get("broadcast:" + getMatch[1], "json");
+    if (!rec) return jsonResp({ error: "Not found" }, 404);
+    return jsonResp(rec, 200);
+  }
+
+  // POST /api/admin/broadcast/:id/retry-failed
+  const retryMatch = subPath.match(/^\/admin\/broadcast\/([A-Za-z0-9]+)\/retry-failed$/);
+  if (retryMatch && method === "POST") {
+    const recId = retryMatch[1];
+    const rec = await db.get("broadcast:" + recId, "json");
+    if (!rec) return jsonResp({ error: "Not found" }, 404);
+    if (!rec.failed || rec.failed.length === 0) {
+      return jsonResp({ error: "No failed recipients to retry" }, 400);
+    }
+    const failedIds = rec.failed.map((f) => f.chatId);
+    rec.recipients = rec.recipients.concat(failedIds);
+    rec.failed = [];
+    rec.status = "queued";
+    rec.finishedAt = null;
+    await db.put("broadcast:" + recId, JSON.stringify(rec));
+    ctx.waitUntil(processBroadcast(recId, env));
+    return jsonResp({ id: recId, requeued: failedIds.length }, 200);
+  }
+
+  // GET /api/admin/broadcasts — index
+  if (subPath === "/admin/broadcasts" && method === "GET") {
+    const idx = (await db.get("broadcasts_index", "json")) || [];
+    const out = [];
+    for (const id of idx.slice(0, 10)) {
+      const rec = await db.get("broadcast:" + id, "json");
+      if (rec) out.push({
+        id: rec.id, createdAt: rec.createdAt, status: rec.status,
+        recipientCount: rec.recipients.length, sent: rec.sent.length,
+        failed: rec.failed.length, text: rec.text.slice(0, 120),
+      });
+    }
+    return jsonResp(out, 200);
+  }
+
+  return jsonResp({ error: "Unknown admin route: " + subPath }, 404);
+}
+
+function jsonResp(obj, status) {
+  return new Response(JSON.stringify(obj), {
+    status: status || 200,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    },
+  });
+}
+
+// Resolve an audience descriptor to a list of chat_ids.
+// Audience: "all_linked" | { sessionId?, examType?, school? }
+async function resolveAudience(audience, db) {
+  const users = (await db.get("TelegramUsers", "json")) || {};
+  if (audience === "all_linked" || !audience) {
+    return Object.values(users).filter((v) => v);
+  }
+  // Filter audience — join Registrations on filter, map to chat ids by phone.
+  let regs = (await db.get("Registrations", "json")) || [];
+  if (!Array.isArray(regs)) regs = [];
+  const f = audience;
+  const matchSession = f.sessionLabel
+    ? (r) => String(r.Session || "").replace(/ \(est\.\)$/, "").trim() === f.sessionLabel
+    : null;
+  const matchExam = f.examType
+    ? (r) => String(r.ExamType || r.examtype || "").toLowerCase() === String(f.examType).toLowerCase()
+    : null;
+  const matchSchool = f.school
+    ? (r) => String(r.School || r.school || "") === f.school
+    : null;
+  const out = [];
+  for (const r of regs) {
+    if (matchSession && !matchSession(r)) continue;
+    if (matchExam && !matchExam(r)) continue;
+    if (matchSchool && !matchSchool(r)) continue;
+    const ph = String(r.Phone || r.phone || "").replace(/\D/g, "").slice(-9);
+    const cid = users[ph];
+    if (cid && out.indexOf(cid) === -1) out.push(cid);
+  }
+  return out;
+}
+
+async function appendBroadcastIndex(db, id) {
+  let idx = (await db.get("broadcasts_index", "json")) || [];
+  if (!Array.isArray(idx)) idx = [];
+  idx.unshift(id);
+  idx = idx.slice(0, 50); // keep last 50 ids (UI shows top 10)
+  await db.put("broadcasts_index", JSON.stringify(idx));
+}
+
+// Pull the broadcast record from KV and send to recipients in chunks,
+// updating the cursor in KV after each chunk so a Worker timeout doesn't
+// lose progress. handleScheduled resumes any record left in "running" state.
+async function processBroadcast(id, env) {
+  const db = env.MOCK_DB;
+  const token = env.BOT_TOKEN;
+  if (!db || !token) return;
+
+  let rec = await db.get("broadcast:" + id, "json");
+  if (!rec || rec.status === "done") return;
+  if (!rec.startedAt) rec.startedAt = new Date().toISOString();
+  rec.status = "running";
+  await db.put("broadcast:" + id, JSON.stringify(rec));
+
+  const CHUNK = 5; // 5 concurrent → ~25 msgs/sec with the 200ms pacing below
+  const PACING_MS = 200; // gap between chunks → 25 msgs/sec ceiling
+  // Stop processing if we've been at it too long; the next cron tick will resume.
+  const SOFT_DEADLINE_MS = 25_000;
+  const startTime = Date.now();
+
+  try {
+    while (rec.cursor < rec.recipients.length) {
+      if (Date.now() - startTime > SOFT_DEADLINE_MS) {
+        // Leave status as "running" — the scheduled handler will pick it up.
+        await db.put("broadcast:" + id, JSON.stringify(rec));
+        return;
+      }
+      const chunk = rec.recipients.slice(rec.cursor, rec.cursor + CHUNK);
+      const results = await Promise.all(
+        chunk.map((chatId) =>
+          sendTelegram(token, "sendMessage", {
+            chat_id: chatId,
+            text: rec.text,
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+          })
+            .then((res) => ({ chatId, ok: !!(res && res.ok), res }))
+            .catch((e) => ({ chatId, ok: false, error: e.message }))
+        )
+      );
+      for (const r of results) {
+        if (r.ok) rec.sent.push(r.chatId);
+        else
+          rec.failed.push({
+            chatId: r.chatId,
+            error: r.error || (r.res && r.res.description) || "unknown",
+            at: new Date().toISOString(),
+          });
+      }
+      rec.cursor += chunk.length;
+      await db.put("broadcast:" + id, JSON.stringify(rec));
+      // Pace to stay under Telegram's 30 msgs/sec global limit.
+      if (rec.cursor < rec.recipients.length) {
+        await new Promise((r) => setTimeout(r, PACING_MS));
+      }
+    }
+    rec.status = "done";
+    rec.finishedAt = new Date().toISOString();
+    await db.put("broadcast:" + id, JSON.stringify(rec));
+
+    // Summary DM to admin.
+    try {
+      await sendTelegram(token, "sendMessage", {
+        chat_id: ADMIN_TELEGRAM_ID,
+        text:
+          "📣 <b>Broadcast complete</b>\n" +
+          "Sent: <b>" + rec.sent.length + "</b>\n" +
+          "Failed: <b>" + rec.failed.length + "</b>\n" +
+          "Recipients: <b>" + rec.recipients.length + "</b>",
+        parse_mode: "HTML",
+      });
+    } catch (e) {}
+  } catch (err) {
+    // Leave the record in "running" so the cron can resume it.
+    try {
+      rec.lastError = String(err && err.message || err);
+      await db.put("broadcast:" + id, JSON.stringify(rec));
+    } catch (e) {}
+  }
+}
+
+// Compute stats for the admin Stats sub-tab.
+async function computeBotStats(db) {
+  const regs = (await db.get("Registrations", "json")) || [];
+  const users = (await db.get("TelegramUsers", "json")) || {};
+  const settings = (await db.get("Settings", "json")) || {};
+  let linked = 0;
+  for (const r of Array.isArray(regs) ? regs : []) {
+    const ph = String(r.Phone || r.phone || "").replace(/\D/g, "").slice(-9);
+    if (users[ph]) linked++;
+  }
+  const totalRegs = Array.isArray(regs) ? regs.length : 0;
+  const idx = (await db.get("broadcasts_index", "json")) || [];
+  let lastBroadcast = null;
+  if (idx.length) {
+    const rec = await db.get("broadcast:" + idx[0], "json");
+    if (rec) {
+      lastBroadcast = {
+        id: rec.id,
+        createdAt: rec.createdAt,
+        status: rec.status,
+        sent: rec.sent.length,
+        failed: rec.failed.length,
+        recipients: rec.recipients.length,
+      };
+    }
+  }
+  // Next scheduled send
+  let nextScheduledSend = null;
+  if (settings.test_date) {
+    let schedules = [];
+    try {
+      schedules = settings.bot_schedules ? JSON.parse(settings.bot_schedules) : [];
+    } catch (e) {}
+    if (!Array.isArray(schedules) || !schedules.length) {
+      schedules = [{ id: "default", label: "Day-before reminder", hoursBeforeTest: 9, templateKey: "reminder", active: true }];
+    }
+    const testMs = new Date(settings.test_date).getTime();
+    const now = Date.now();
+    for (const s of schedules) {
+      if (!s.active) continue;
+      const fireMs = testMs - Number(s.hoursBeforeTest || 0) * 3600_000;
+      if (fireMs > now && (!nextScheduledSend || fireMs < nextScheduledSend.fireMs)) {
+        nextScheduledSend = { fireMs, label: s.label, hoursBeforeTest: s.hoursBeforeTest };
+      }
+    }
+    if (nextScheduledSend) nextScheduledSend.fireAt = new Date(nextScheduledSend.fireMs).toISOString();
+  }
+  return {
+    linkedCount: linked,
+    unlinkedCount: Math.max(0, totalRegs - linked),
+    totalRegistrations: totalRegs,
+    lastBroadcast,
+    nextScheduledSend,
+    lastCronError: settings.cron_last_error || null,
+    reminderSent: settings.reminder_sent || null,
+  };
 }
 
 function generateUniqueCandidateNumber(existingRows) {
@@ -1242,6 +1659,65 @@ function parseTimeToMin(timeStr) {
   var p = clean.split(":");
   if (p.length < 2) return NaN;
   return parseInt(p[0], 10) * 60 + parseInt(p[1], 10);
+}
+
+// Validate the chosen Session + SpeakingTime against session_config and the
+// existing Registrations roster. Returns an error code on conflict, or null when fine.
+// Authoritative checks: structural overlap with the student's own main, and
+// over-capacity speaking-slot bookings (counted against Registrations, since
+// the client decrements Seats BEFORE this POST runs).
+async function validateScheduling(db, registrations, payload) {
+  if (!payload) return null;
+  const settings = (await db.get("Settings", "json")) || {};
+  const cfgRaw = settings.session_config;
+  if (!cfgRaw) return null; // No config saved yet → nothing to validate against
+  let sessions;
+  try {
+    sessions = typeof cfgRaw === "string" ? JSON.parse(cfgRaw) : cfgRaw;
+  } catch (e) {
+    return null;
+  }
+  if (!Array.isArray(sessions) || !sessions.length) return null;
+
+  const sessionLabel = String(payload.Session || "").replace(/ \(est\.\)$/, "").trim();
+  if (!sessionLabel) return null;
+  const sess = sessions.find((s) => String(s.label).trim() === sessionLabel);
+  if (!sess) return "SESSION_NOT_FOUND";
+
+  const speakRaw = payload.SpeakingTime;
+  if (!speakRaw) return null; // L+R only — nothing more to check
+  const speakLabel = String(speakRaw).replace(/ \(est\.\)$/, "").trim();
+  if (!/^\d{1,2}:\d{2}$/.test(speakLabel)) return null;
+
+  const toMin = (s) => {
+    const p = String(s).split(":");
+    return parseInt(p[0], 10) * 60 + parseInt(p[1], 10);
+  };
+  const dur = Number(sess.speakingDuration) || 15;
+  const mDur = Number(sess.mainDuration) || 150;
+  const buf = sess.bufferMinutes !== undefined ? Number(sess.bufferMinutes) : 10;
+  const mStart = toMin(sess.label) - buf;
+  const mEnd = toMin(sess.label) + mDur + buf;
+  const sStart = toMin(speakLabel);
+  const sEnd = sStart + dur;
+
+  // Overlap with the student's OWN main session (with buffer) is forbidden.
+  if (sStart < mEnd && sEnd > mStart) return "SPEAKING_OVERLAPS_MAIN";
+
+  // Capacity check: count existing registrations holding this exact speaking slot.
+  // (Use teachers from any session that shares the day; assume consistent.)
+  const teachers = Number(sess.teachers) || 0;
+  if (teachers <= 0) return "SPEAKING_DISABLED";
+  let held = 0;
+  if (Array.isArray(registrations)) {
+    for (const r of registrations) {
+      const rs = String(r.SpeakingTime || r.speakingtime || "").replace(/ \(est\.\)$/, "").trim();
+      if (rs === speakLabel) held++;
+    }
+  }
+  if (held >= teachers) return "SPEAKING_SLOT_FULL";
+
+  return null;
 }
 
 function correctRegistration(reg) {
@@ -1301,99 +1777,137 @@ function correctRegistration(reg) {
 }
 
 // ============================================================
-// CRON SCHEDULED HANDLER — runs daily at 15:00 UTC (20:00 UZT)
+// CRON SCHEDULED HANDLER — runs hourly
 // ============================================================
-async function handleScheduled(env) {
+// Drives three things:
+// 1) Auto-cleanup of registrations 2 days after the test date.
+// 2) Multi-entry reminder scheduling (`bot_schedules`) — fires each
+//    entry exactly once when (test_date - hoursBeforeTest) falls in
+//    the past hour.
+// 3) Resumes any in-flight broadcasts whose Worker invocation died.
+async function handleScheduled(env, ctx) {
   var db = env.MOCK_DB;
   var token = env.BOT_TOKEN;
   if (!db || !token) return;
 
   try {
-    var settings = await db.get("Settings", "json");
-    if (!settings || typeof settings !== "object") settings = {};
+    var settings = (await db.get("Settings", "json")) || {};
 
-    // Look for the actual test date, not the registration deadline
+    // --- 3) Resume in-flight broadcasts first ---
+    var idx = (await db.get("broadcasts_index", "json")) || [];
+    if (Array.isArray(idx)) {
+      for (var i = 0; i < idx.length; i++) {
+        var rec = await db.get("broadcast:" + idx[i], "json");
+        if (!rec) continue;
+        if (rec.status === "running" && rec.cursor < rec.recipients.length) {
+          // Resume regardless of age — Worker timed out, KV state is the truth.
+          if (ctx && ctx.waitUntil) ctx.waitUntil(processBroadcast(rec.id, env));
+          else await processBroadcast(rec.id, env);
+        }
+      }
+    }
+
     var actualTestDateStr = settings.test_date;
-    if (!actualTestDateStr) return; // Admin hasn't set the test date yet
-
+    if (!actualTestDateStr) return;
     var testDate = new Date(actualTestDateStr);
     if (isNaN(testDate.getTime())) return;
 
-    // Calculate dates in Uzbekistan time (UTC+5)
     var now = new Date();
     var nowUZT = new Date(now.getTime() + UZT_OFFSET_MS);
-    var tomorrowUZT = new Date(nowUZT.getTime() + 24 * 60 * 60 * 1000);
-
     var testDateUZT = new Date(testDate.getTime() + UZT_OFFSET_MS);
 
-    // --- NEW: AUTO-CLEANUP LOGIC ---
-    // Database cleanup happens 2 days after the actual test date
+    // --- 1) AUTO-CLEANUP (2 days after test_date) ---
     var clearDate = new Date(testDate.getTime() + 2 * 24 * 60 * 60 * 1000);
     var clearDateUZT = new Date(clearDate.getTime() + UZT_OFFSET_MS);
-
-    var isClearDayOrAfter = 
+    var isClearDayOrAfter =
       (nowUZT.getUTCFullYear() > clearDateUZT.getUTCFullYear()) ||
       (nowUZT.getUTCFullYear() === clearDateUZT.getUTCFullYear() && nowUZT.getUTCMonth() > clearDateUZT.getUTCMonth()) ||
       (nowUZT.getUTCFullYear() === clearDateUZT.getUTCFullYear() && nowUZT.getUTCMonth() === clearDateUZT.getUTCMonth() && nowUZT.getUTCDate() >= clearDateUZT.getUTCDate());
 
     if (isClearDayOrAfter && settings.cleaned_up !== actualTestDateStr) {
-      // 1. Wipe all students, Telegram links, and release all seats
       await db.put("Registrations", JSON.stringify([]));
       await db.put("TelegramUsers", JSON.stringify({}));
       await db.put("Seats", JSON.stringify({}));
-      
-      // 2. Mark this test date as "cleaned up" so it doesn't wipe repeatedly
       settings.cleaned_up = actualTestDateStr;
+      settings.bot_schedule_fired = "{}"; // reset so next test_date can fire schedules
       await db.put("Settings", JSON.stringify(settings));
-      
-      // 3. Notify the Admin
       try {
         await sendTelegram(token, "sendMessage", {
           chat_id: ADMIN_TELEGRAM_ID,
           text: "🧹 <b>Database Auto-Cleaned</b>\n\nThe test day has passed! All registered students and Telegram links have been wiped to prepare for your next test.",
           parse_mode: "HTML"
         });
-      } catch(e) {}
-      
-      return; // Exit early, no need to send reminders for an old test
+      } catch (e) {}
+      return;
     }
 
-    // Is tomorrow the test day?
-    var isTomorrow =
-      tomorrowUZT.getUTCFullYear() === testDateUZT.getUTCFullYear() &&
-      tomorrowUZT.getUTCMonth() === testDateUZT.getUTCMonth() &&
-      tomorrowUZT.getUTCDate() === testDateUZT.getUTCDate();
-
-    if (!isTomorrow) return;
-
-    // Already sent today?
-    var todayStr = nowUZT.toISOString().slice(0, 10);
-    if (settings.reminder_sent === todayStr) return;
-
-    // Send reminders to all linked students
-    var result = await sendAllReminders(db, token);
-
-    // Mark as sent to prevent duplicates
-    settings.reminder_sent = todayStr;
-    await db.put("Settings", JSON.stringify(settings));
-
-    // Notify admin about the automated send
+    // --- 2) Schedule list ---
+    var schedules;
     try {
-      await sendTelegram(token, "sendMessage", {
-        chat_id: ADMIN_TELEGRAM_ID,
-        text:
-          "🔔 <b>Automated Reminders Sent</b>\n\n" +
-          "📤 Sent: " + result.sent +
-          "\n❌ Failed: " + result.failed +
-          "\n🔗 Not linked: " + result.unlinked,
-        parse_mode: "HTML",
-      });
-    } catch (e) {}
+      schedules = settings.bot_schedules ? JSON.parse(settings.bot_schedules) : null;
+    } catch (e) { schedules = null; }
+    if (!Array.isArray(schedules) || !schedules.length) {
+      // Default: today's behavior — one entry, fires 9h before test_date.
+      schedules = [{
+        id: "default", label: "Day-before reminder",
+        hoursBeforeTest: 9, templateKey: "reminder", active: true,
+      }];
+    }
+
+    // Idempotence ledger: { [test_date]: { [entryId]: true } }
+    var firedLedger;
+    try {
+      firedLedger = settings.bot_schedule_fired ? JSON.parse(settings.bot_schedule_fired) : {};
+    } catch (e) { firedLedger = {}; }
+    if (!firedLedger[actualTestDateStr]) firedLedger[actualTestDateStr] = {};
+
+    var fired = false;
+    for (var s = 0; s < schedules.length; s++) {
+      var entry = schedules[s];
+      if (!entry.active) continue;
+      if (firedLedger[actualTestDateStr][entry.id]) continue;
+      var fireMs = testDate.getTime() - Number(entry.hoursBeforeTest || 0) * 3600_000;
+      // Fire if we're within the past hour of fireAt (window = [fireAt, fireAt + 1h)).
+      var dt = now.getTime() - fireMs;
+      if (dt < 0 || dt >= 3600_000) continue;
+
+      var result = await sendAllReminders(db, token);
+      firedLedger[actualTestDateStr][entry.id] = true;
+      settings.bot_schedule_fired = JSON.stringify(firedLedger);
+      settings.reminder_sent = nowUZT.toISOString().slice(0, 10); // legacy field — keep for /stats
+      await db.put("Settings", JSON.stringify(settings));
+      fired = true;
+
+      try {
+        await sendTelegram(token, "sendMessage", {
+          chat_id: ADMIN_TELEGRAM_ID,
+          text:
+            "🔔 <b>Scheduled reminder fired</b>\n\n" +
+            "Entry: <b>" + escHtml(entry.label || entry.id) + "</b>\n" +
+            "📤 Sent: " + result.sent +
+            "\n❌ Failed: " + result.failed +
+            "\n🔗 Not linked: " + result.unlinked,
+          parse_mode: "HTML",
+        });
+      } catch (e) {}
+    }
+    if (!fired) {
+      // Clear last-cron-error on a clean tick so admin Stats reflects current health.
+      if (settings.cron_last_error) {
+        delete settings.cron_last_error;
+        await db.put("Settings", JSON.stringify(settings));
+      }
+    }
   } catch (cronError) {
     try {
+      var settingsForErr = (await db.get("Settings", "json")) || {};
+      settingsForErr.cron_last_error = String(cronError && cronError.message || cronError);
+      await db.put("Settings", JSON.stringify(settingsForErr));
+    } catch (e) {}
+    try {
       await sendTelegram(token, "sendMessage", {
         chat_id: ADMIN_TELEGRAM_ID,
-        text: "🚨 <b>CRON Reminder Task Failure Alert</b>\n\nAn unexpected error occurred during the daily automated reminder execution:\n\n<code>" + escHtml(cronError.stack || cronError.message) + "</code>",
+        text: "🚨 <b>CRON Reminder Task Failure Alert</b>\n\nAn unexpected error occurred during the hourly cron execution:\n\n<code>" + escHtml(cronError.stack || cronError.message) + "</code>",
         parse_mode: "HTML",
       });
     } catch (e) {}

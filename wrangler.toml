@@ -10,7 +10,10 @@ binding = "MOCK_DB"
 id = "b50116de23d643fb81b0e1ba27de8923"
 
 [triggers]
-crons = ["0 15 * * *"]
+# Hourly cron — the schedule list in Settings (`bot_schedules`) decides
+# which reminder entries fire at any given hour. Also resumes in-flight
+# broadcasts left over from a Worker timeout.
+crons = ["0 * * * *"]
 [observability]
 enabled = false
 head_sampling_rate = 1

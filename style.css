@@ -758,3 +758,85 @@ body::before {
         transition-delay: 0s !important;
       }
     }
+
+    /* ========== SPEAKING-GRID STEP ========== */
+    .speak-hint {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 12px;
+      line-height: 1.5;
+    }
+    .speak-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .speak-cell {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 8px;
+      text-align: center;
+      cursor: pointer;
+      background: var(--surface);
+      transition: all 0.18s ease;
+      user-select: none;
+    }
+    .speak-cell:hover:not(.disabled) {
+      border-color: var(--border-focus, var(--primary));
+      transform: translateY(-1px);
+      box-shadow: 0 4px 10px rgba(0, 0, 0, 0.06);
+    }
+    .speak-cell.selected {
+      border-color: var(--primary);
+      background: rgba(61, 189, 139, 0.08);
+      box-shadow: 0 0 0 2px rgba(61, 189, 139, 0.25) inset;
+    }
+    .speak-cell.disabled {
+      cursor: not-allowed;
+      opacity: 0.45;
+      background: var(--surface2, rgba(255, 255, 255, 0.02));
+    }
+    .speak-cell.blocked {
+      background-image: repeating-linear-gradient(
+        45deg,
+        transparent,
+        transparent 6px,
+        rgba(224, 90, 90, 0.06) 6px,
+        rgba(224, 90, 90, 0.06) 12px
+      );
+    }
+    .speak-cell.full {
+      border-color: rgba(224, 90, 90, 0.35);
+    }
+    .speak-time {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      color: var(--text);
+    }
+    .speak-cell.disabled .speak-time {
+      color: var(--muted);
+    }
+    .speak-seats {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+    .speak-seats strong {
+      color: var(--primary);
+    }
+    .speak-cell.selected .speak-seats strong {
+      color: var(--primary);
+    }
+    .speak-cell.disabled .speak-seats strong {
+      color: inherit;
+    }
+    @media (max-width: 520px) {
+      .speak-grid {
+        grid-template-columns: repeat(auto-fill, minmax(78px, 1fr));
+        gap: 6px;
+      }
+      .speak-cell { padding: 8px 6px; }
+      .speak-time { font-size: 13px; }
+    }

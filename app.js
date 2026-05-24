@@ -1,46 +1,38 @@
 // All requests go through the Cloudflare proxy — token stays server-side
 var API = "/api";
 
-var VALID_SLOT_IDS = ["slot_0800", "slot_0940", "slot_1120", "slot_1300"];
+// Per-main-session config. Each session owns its own durations + buffer + teachers.
+// `period` retained for backwards-compat display labels.
+var VALID_SLOT_IDS = ["main_0800", "main_1040"];
 var SLOTS = [
   {
-    id: "slot_0800",
+    id: "main_0800",
     label: "08:00",
     period: "Morning",
-    maxSeats: 10,
-    speakingEnabled: false,
-    teachers: 1,
+    mainSeats: 10,
+    mainDuration: 150,
+    bufferMinutes: 10,
+    speakingDuration: 15,
+    teachers: 2,
   },
   {
-    id: "slot_0940",
-    label: "09:40",
-    period: "Morning",
-    maxSeats: 10,
-    speakingEnabled: false,
-    teachers: 1,
-  },
-  {
-    id: "slot_1120",
-    label: "11:20",
+    id: "main_1040",
+    label: "10:40",
     period: "Midday",
-    maxSeats: 10,
-    speakingEnabled: false,
-    teachers: 1,
-  },
-  {
-    id: "slot_1300",
-    label: "13:00",
-    period: "Afternoon",
-    maxSeats: 10,
-    speakingEnabled: false,
-    teachers: 1,
+    mainSeats: 10,
+    mainDuration: 150,
+    bufferMinutes: 10,
+    speakingDuration: 15,
+    teachers: 2,
   },
 ];
 var MAX = 10;
-var seats = { slot_0800: MAX, slot_0940: MAX, slot_1120: MAX, slot_1300: MAX };
-var step = 1; // 1=slot, 5=exam-type, 2=details, 3=manage, 4=change-slot
+// Day-level config — defaults derived from SLOTS in normalizeDayConfig().
+var dayConfig = { dayStart: "08:00", dayClose: "13:10", dayCloseOverride: false };
+var seats = {};
+var step = 1; // 1=session, 6=speaking-grid, 5=exam-type (legacy), 2=details, 3=manage, 4=change-slot, 7=change-speak
 var prevStep = null;
-var form = { slot: null, name: "", phone: "", school: "" };
+var form = { slot: null, speak: null, name: "", phone: "", school: "" };
 var errors = {};
 var submitting = false;
 var loadError = false;
@@ -69,6 +61,39 @@ var MS_PER_HOUR = 3600000;
 var MS_PER_MINUTE = 60000;
 var adminStudentFilter = ""; // search filter for students tab
 var adminStudentsLoadedAt = 0; // timestamp of last students load
+var adminDayDraft = null; // working copy of dayConfig during admin edit
+
+// --- Bot admin tab state ---
+var adminBotSubtab = "texts"; // 'texts' | 'broadcast' | 'schedules' | 'stats'
+var adminBotTexts = null; // loaded values keyed by setting key
+var adminBotTextsLoading = false;
+var adminBotTextsError = "";
+var adminBotSchedules = null; // working copy (array)
+var adminBotSchedulesLoaded = false;
+var adminBotSchedulesError = "";
+var adminBotBroadcastText = ""; // textarea contents
+var adminBotBroadcastAudience = "all_linked";
+var adminBotBroadcastPolling = false;
+var adminBotActiveBroadcastId = null;
+var adminBotActiveBroadcast = null; // last polled record
+var adminBotBroadcastHistory = null; // array of summaries (last 10)
+var adminBotStats = null;
+var adminBotStatsLoading = false;
+var adminBotStatsError = "";
+var adminBotStatsTimer = null;
+// Ordered list of editable text keys + admin-facing labels.
+var BOT_TEXT_FIELDS = [
+  { key: "bot_text_rules", label: "Test rules (/rules)", rows: 8 },
+  { key: "bot_text_welcome", label: "Welcome (/start no payload)", rows: 6 },
+  { key: "bot_text_help", label: "/help line", rows: 2 },
+  { key: "bot_text_location", label: "/location body", rows: 6 },
+  { key: "bot_text_location_line", label: "Location line (embedded in notifications)", rows: 2 },
+  { key: "bot_text_registration_success_prefix", label: "Registration success prefix", rows: 4 },
+  { key: "bot_text_registration_updated_prefix", label: "Registration updated prefix", rows: 4 },
+  { key: "bot_text_cancellation", label: "Cancellation message", rows: 4 },
+  { key: "bot_text_reminder_header_template", label: "Reminder header (use {name})", rows: 4 },
+  { key: "bot_text_reminder_tips", label: "Reminder tips section (use {alarm})", rows: 6 },
+];
 
 // Restore admin session from sessionStorage
 try {
@@ -78,12 +103,16 @@ try {
 } catch (e) {}
 
 // --- Main+Speaking mode ---
-var SPEAKING_SUFFIX = "_speaking";
-var MAIN_DURATION = 150; // minutes for L+R+W
-var SPEAK_DURATION = 15; // minutes per student speaking slot
-var SPEAKING_GAP = 10; // gap in minutes between main exam and speaking start
+var SPEAKING_SUFFIX = "_speaking"; // legacy — only used to read old data
+var MAIN_DURATION_DEFAULT = 150; // fallback when a session is missing mainDuration
+var SPEAK_DURATION_DEFAULT = 15;
+var SPEAKING_GAP_DEFAULT = 10;
+// Legacy aliases — some functions still reference these for fallback math.
+var MAIN_DURATION = MAIN_DURATION_DEFAULT;
+var SPEAK_DURATION = SPEAK_DURATION_DEFAULT;
+var SPEAKING_GAP = SPEAKING_GAP_DEFAULT;
 var registrationMode = "lr_only"; // 'lr_only' | 'main_speaking'
-var examType = null; // 'main' | 'speaking' — set at step 5
+var examType = null; // legacy — kept for migration of old localStorage
 
 // --- Local registration storage ---
 function getRegistration() {
@@ -116,7 +145,8 @@ function clearRegistration() {
 
 // --- Time helpers (Main+Speaking mode) ---
 function toMin(label) {
-  var p = label.split(":");
+  if (!label) return 0;
+  var p = String(label).split(":");
   return parseInt(p[0]) * 60 + parseInt(p[1]);
 }
 function toHHMM(m) {
@@ -124,47 +154,126 @@ function toHHMM(m) {
     n = m % 60;
   return (h < 10 ? "0" : "") + h + ":" + (n < 10 ? "0" : "") + n;
 }
-// Returns estimated schedule for a student about to register.
-// myPos = seats already taken + 1 (they are next in queue).
-function calcSchedule(slotId, et) {
+// Pool id used by the Seats sheet for a 15-min speaking slot starting at HH:MM.
+function speakPoolId(label) {
+  return "speak_" + label.replace(":", "");
+}
+// Normalize a legacy `slot_NNNN` id to the new `main_NNNN` id used internally.
+function normalizeSlotId(id) {
+  if (typeof id !== "string") return id;
+  if (id.indexOf("slot_") === 0) return "main_" + id.slice(5);
+  return id;
+}
+// Day-level defaults derived from SLOTS when admin hasn't pinned an override.
+function normalizeDayConfig() {
+  if (!Array.isArray(SLOTS) || !SLOTS.length) return;
+  var sessions = SLOTS.slice().sort(function (a, b) {
+    return toMin(a.label) - toMin(b.label);
+  });
+  var earliestStart = toMin(sessions[0].label);
+  var lastEnd = 0;
+  sessions.forEach(function (s) {
+    var dur = Number(s.mainDuration) || MAIN_DURATION_DEFAULT;
+    var end = toMin(s.label) + dur;
+    if (end > lastEnd) lastEnd = end;
+  });
+  if (!dayConfig.dayStart) dayConfig.dayStart = toHHMM(earliestStart);
+  if (!dayConfig.dayCloseOverride) {
+    dayConfig.dayClose = toHHMM(lastEnd);
+  }
+}
+// Build the day-wide grid of 15-min speaking slots with blockedByMain[] per slot.
+// Pure function — pass arguments rather than read globals so the admin preview
+// can call it with a draft config.
+function buildSpeakingGrid(sessions, dc) {
+  sessions = sessions || SLOTS;
+  dc = dc || dayConfig;
+  if (!sessions.length) return [];
+  // Effective speaking duration: assume consistent across sessions (UI enforces).
+  var dur = Number(sessions[0].speakingDuration) || SPEAK_DURATION_DEFAULT;
+  var teachers = Math.max(0, Number(sessions[0].teachers) || 0);
+
+  var sorted = sessions.slice().sort(function (a, b) {
+    return toMin(a.label) - toMin(b.label);
+  });
+  var earliestStart = toMin(sorted[0].label);
+  var lastMainEnd = 0;
+  sorted.forEach(function (s) {
+    var d = Number(s.mainDuration) || MAIN_DURATION_DEFAULT;
+    var e = toMin(s.label) + d;
+    if (e > lastMainEnd) lastMainEnd = e;
+  });
+
+  var dayStart = dc.dayStart ? toMin(dc.dayStart) : earliestStart;
+  var dayClose = dc.dayClose ? toMin(dc.dayClose) : lastMainEnd;
+  if (dayClose <= dayStart) dayClose = dayStart + dur;
+
+  var grid = [];
+  for (var s = dayStart; s + dur <= dayClose; s += dur) {
+    var slot = {
+      start: s,
+      end: s + dur,
+      label: toHHMM(s),
+      capacity: teachers,
+      blockedByMain: [],
+    };
+    sessions.forEach(function (sess) {
+      var mDur = Number(sess.mainDuration) || MAIN_DURATION_DEFAULT;
+      var buf = Number(sess.bufferMinutes) || 0;
+      var mStart = toMin(sess.label) - buf;
+      var mEnd = toMin(sess.label) + mDur + buf;
+      // Overlap of [s, s+dur] and [mStart, mEnd]
+      if (slot.start < mEnd && slot.end > mStart) {
+        slot.blockedByMain.push(sess.id);
+      }
+    });
+    slot.poolId = speakPoolId(slot.label);
+    slot.available = slot.blockedByMain.length === 0 && slot.capacity > 0;
+    grid.push(slot);
+  }
+  return grid;
+}
+
+// Slots valid for a student whose chosen main session is `mainId`.
+function validSpeakingSlots(mainId, sessions, dc) {
+  return buildSpeakingGrid(sessions, dc).filter(function (g) {
+    return g.capacity > 0 && g.blockedByMain.indexOf(mainId) === -1;
+  });
+}
+
+// Remaining seats for a speaking pool id (live seats map).
+function speakPoolRemaining(poolId) {
+  if (seats[poolId] !== undefined) return Number(seats[poolId]);
+  // Default to capacity from current SLOTS config.
+  return SLOTS.length ? Math.max(0, Number(SLOTS[0].teachers) || 0) : 0;
+}
+
+// Returns estimated schedule for a student. In the new flow speakTime is
+// the explicitly chosen 15-min slot label; this helper just packages it
+// alongside the session's main start time.
+function calcSchedule(slotId, speakLabel) {
   var si = SLOTS.find(function (s) {
     return s.id === slotId;
   });
-  if (!si || !et) return null;
-  var teachers = Math.max(1, si.teachers || 1);
-  var start = toMin(si.label);
-  var pid = et === "speaking" ? slotId + SPEAKING_SUFFIX : slotId;
-  var maxP = getMaxSeats(pid);
-  var rem = seats[pid] !== undefined ? Number(seats[pid]) : maxP;
-  var myPos = maxP - rem + 1; // 1-indexed
-  // Each teacher handles one student at a time in parallel
-  // Position 1&2 (2 teachers) both at offset 0, positions 3&4 at offset 15, etc.
-  var spkOffset = Math.floor((myPos - 1) / teachers) * SPEAK_DURATION;
-  if (et === "main") {
-    return {
-      mainTime: toHHMM(start),
-      speakTime: toHHMM(start + MAIN_DURATION + SPEAKING_GAP + spkOffset),
-      pos: myPos,
-      teachers: teachers,
-    };
-  } else {
-    return {
-      speakTime: toHHMM(start + spkOffset),
-      mainTime: toHHMM(start + MAIN_DURATION + SPEAKING_GAP),
-      pos: myPos,
-      teachers: teachers,
-    };
-  }
+  if (!si) return null;
+  return {
+    mainTime: si.label,
+    speakTime: speakLabel || null,
+  };
 }
 function poolId(slotId, et) {
-  return et === "speaking" ? slotId + SPEAKING_SUFFIX : slotId;
+  // Legacy helper retained for the change-slot flow. With the new model the
+  // main pool is just the slot id; speaking pools are addressed via speakPoolId.
+  if (et === "speaking") return slotId + SPEAKING_SUFFIX;
+  return slotId;
 }
 function isMSSession(slotId) {
   if (registrationMode !== "main_speaking") return false;
   var s = SLOTS.find(function (sl) {
     return sl.id === slotId;
   });
-  return s ? !!s.speakingEnabled : false;
+  if (!s) return false;
+  return Number(s.teachers) > 0;
 }
 
 // --- Input handlers ---
@@ -226,6 +335,7 @@ async function loadSeats() {
   // Load session config FIRST so VALID_SLOT_IDS is correct before filtering seat rows
   await loadSessionConfig();
   await loadDeadline();
+  normalizeDayConfig();
 
   try {
     var res = await fetch(API + "?sheet=Seats");
@@ -234,16 +344,22 @@ async function loadSeats() {
     if (!Array.isArray(rows))
       throw new Error("Unexpected response from Seats sheet");
     rows.forEach(function (row) {
-      var id = row["Slot"] || row["slot"];
+      var rawId = row["Slot"] || row["slot"];
+      if (!rawId) return;
       var rem =
         row["Remaining"] !== undefined ? row["Remaining"] : row["remaining"];
-      var isBase = id && VALID_SLOT_IDS.indexOf(id) !== -1;
-      var isSpeak =
-        id &&
-        id.endsWith(SPEAKING_SUFFIX) &&
-        VALID_SLOT_IDS.indexOf(id.slice(0, -SPEAKING_SUFFIX.length)) !== -1;
-      if ((isBase || isSpeak) && rem !== undefined) {
+      // Map legacy ids to new namespace on read so old KV/Sheets data keeps working.
+      var id = normalizeSlotId(rawId);
+      var isMain = VALID_SLOT_IDS.indexOf(id) !== -1;
+      var isSpeak = id.indexOf("speak_") === 0;
+      // Legacy speaking pool rows (`slot_NNNN_speaking`) — fold into main remaining as
+      // a sanity floor; the new flow doesn't use a per-session speaking pool.
+      var isLegacySpeak =
+        typeof rawId === "string" && rawId.indexOf(SPEAKING_SUFFIX) !== -1;
+      if ((isMain || isSpeak) && rem !== undefined) {
         seats[id] = Math.max(0, Math.min(getMaxSeats(id), Number(rem)));
+      } else if (isLegacySpeak && rem !== undefined) {
+        seats[rawId] = Math.max(0, Number(rem));
       }
     });
     loadError = false;
@@ -362,8 +478,13 @@ async function getLiveSeatCount(slotId) {
   );
   if (!res.ok) throw new Error("Seat fetch error " + res.status);
   var rows = await res.json();
-  if (!Array.isArray(rows) || !rows.length)
+  // For speaking-grid pools we auto-provision on first use: missing row == full capacity.
+  if (!Array.isArray(rows) || !rows.length) {
+    if (typeof slotId === "string" && slotId.indexOf("speak_") === 0) {
+      return getMaxSeats(slotId);
+    }
     throw new Error("No seat row found for " + slotId);
+  }
   var rem =
     rows[0]["Remaining"] !== undefined
       ? rows[0]["Remaining"]
@@ -378,6 +499,24 @@ async function updateSeat(slotId, delta) {
     throw new Error("Seat already taken");
   }
   var newVal = Math.max(0, Math.min(getMaxSeats(slotId), liveCount + delta));
+  // Detect whether the row exists. If not (speaking-grid pools may be lazy),
+  // POST a fresh row; otherwise PATCH.
+  var rowExists = seats[slotId] !== undefined;
+  if (!rowExists) {
+    // Probe once more — getLiveSeatCount returned default for missing speak_* rows,
+    // so we don't know definitively. Just try a POST and fall back to PATCH on conflict.
+    var postRes = await fetch(API + "?sheet=Seats", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH },
+      body: JSON.stringify({ data: { Slot: slotId, Remaining: newVal } }),
+    });
+    if (!postRes.ok && postRes.status !== 409) {
+      // Some backends 200 on overwrite — treat any non-409 non-2xx as fatal.
+      throw new Error("Seat API error " + postRes.status);
+    }
+    seats[slotId] = newVal;
+    return;
+  }
   var res = await fetch(
     API + "/Slot/" + encodeURIComponent(slotId) + "?sheet=Seats",
     {
@@ -442,10 +581,14 @@ async function updateRegistrationSlot(
   if (!res.ok) throw new Error("Update API error " + res.status);
 }
 
-// Fetch all registrations for a session, recalculate speaking times in registration order,
-// and PATCH every student's SpeakingTime in the sheet.
-// Called after any cancel or exam-type change so remaining students' times shift correctly.
-async function recalculateSpeakingTimes(slotId) {
+// New model assigns explicit speaking times at registration, so there's no
+// queue to recompute after a cancellation. This is a no-op shim that keeps
+// the old call sites working.
+async function recalculateSpeakingTimes(slotId) { /* no-op in new model */ }
+
+// LEGACY queue-recalculation kept under a different name in case we ever need
+// to migrate old data — never called.
+async function recalculateSpeakingTimes_LEGACY(slotId) {
   var si = SLOTS.find(function (s) {
     return s.id === slotId;
   });
@@ -606,31 +749,38 @@ function getDoorsOpenTime(label) {
 }
 
 function renderProgressBar(activeStep) {
-  var hasExamStep = (registrationMode === "main_speaking" && form.slot && isMSSession(form.slot));
+  // Show 3 steps whenever any session has speaking enabled in main_speaking mode,
+  // so the user sees the full path before picking a session.
+  var anyMS = registrationMode === "main_speaking" && SLOTS.some(function (s) {
+    return Number(s.teachers) > 0;
+  });
+  var hasSpeakStep = form.slot
+    ? registrationMode === "main_speaking" && isMSSession(form.slot)
+    : anyMS;
   var labels = "";
   var widthPct = 0;
-  
-  if (hasExamStep) {
+
+  if (hasSpeakStep) {
     if (activeStep === 1) {
-      labels = '<span class="current">1 · Session</span><span>2 · Exam</span><span>3 · Details</span>';
+      labels = '<span class="current">1 · Session</span><span>2 · Speaking</span><span>3 · Details</span>';
       widthPct = 33;
-    } else if (activeStep === 5) {
-      labels = '<span>1 · Session</span><span class="current">2 · Exam</span><span>3 · Details</span>';
+    } else if (activeStep === 6) {
+      labels = '<span>1 · Session</span><span class="current">2 · Speaking</span><span>3 · Details</span>';
       widthPct = 66;
-    } else { // activeStep === 2
-      labels = '<span>1 · Session</span><span>2 · Exam</span><span class="current">3 · Details</span>';
+    } else { // step 2
+      labels = '<span>1 · Session</span><span>2 · Speaking</span><span class="current">3 · Details</span>';
       widthPct = 100;
     }
   } else {
     if (activeStep === 1) {
       labels = '<span class="current">1 · Session</span><span>2 · Details</span>';
       widthPct = 50;
-    } else { // activeStep === 2
+    } else {
       labels = '<span>1 · Session</span><span class="current">2 · Details</span>';
       widthPct = 100;
     }
   }
-  
+
   return (
     '<div class="dl-progress-wrap">' +
     '<div class="dl-progress-labels">' + labels + '</div>' +
@@ -685,17 +835,11 @@ function renderStep1() {
   var progressHtml = renderProgressBar(1);
   
   var cards = SLOTS.map(function (s) {
-    var mainRem = seats[s.id] !== undefined ? Number(seats[s.id]) : 0;
-    var spkRem =
-      seats[s.id + SPEAKING_SUFFIX] !== undefined
-        ? Number(seats[s.id + SPEAKING_SUFFIX])
-        : 0;
-    // For MS sessions: use whichever pool has seats; for L+R use main only
-    var rem = isMSSession(s.id) ? (mainRem > 0 ? mainRem : spkRem) : mainRem;
+    var mainRem = seats[s.id] !== undefined ? Number(seats[s.id]) : getMaxSeats(s.id);
+    var rem = mainRem;
     var slotMax = getMaxSeats(s.id);
     var urgentThreshold = Math.max(1, Math.ceil(slotMax * 0.2));
-    // Full only when all available pools are empty
-    var isFull = isMSSession(s.id) ? mainRem <= 0 && spkRem <= 0 : rem === 0;
+    var isFull = rem <= 0;
     var isSel = form.slot === s.id;
     var isUrgent = rem <= urgentThreshold && !isFull;
     var cls = ["time-card", isFull ? "full" : "", isSel ? "selected" : "", !hasAnimatedCards ? "animate-in" : "", isUrgent ? "urgent" : ""]
@@ -752,11 +896,7 @@ function renderStep1() {
     );
   }).join("");
   
-  var canNext =
-    form.slot &&
-    (isMSSession(form.slot)
-      ? seats[form.slot] > 0 || seats[form.slot + SPEAKING_SUFFIX] > 0
-      : seats[form.slot] > 0);
+  var canNext = form.slot && (seats[form.slot] === undefined || seats[form.slot] > 0);
   return (
     countdownHtml +
     errBanner +
@@ -779,7 +919,79 @@ function renderStep1() {
   );
 }
 
-// --- Render step 5: exam type selection ---
+// --- Render step 6: speaking-time grid ---
+function renderSpeakingGrid() {
+  var si = SLOTS.find(function (s) {
+    return s.id === form.slot;
+  });
+  if (!si) {
+    step = 1;
+    return renderStep1();
+  }
+  var grid = buildSpeakingGrid(SLOTS, dayConfig);
+  var teachers = Math.max(0, Number(si.teachers) || 0);
+  var mDur = Number(si.mainDuration) || MAIN_DURATION_DEFAULT;
+  var mainStart = toMin(si.label);
+  var mainEnd = mainStart + mDur;
+
+  var cells = grid.map(function (g) {
+    var rem = seats[g.poolId] !== undefined ? Number(seats[g.poolId]) : g.capacity;
+    var blocksMe = g.blockedByMain.indexOf(si.id) !== -1;
+    var isFull = rem <= 0;
+    var isSelected = form.speak === g.label;
+    var disabled = blocksMe || isFull || g.capacity <= 0;
+    var reason = "";
+    if (blocksMe) reason = "During your main exam";
+    else if (isFull) reason = "Full";
+    else if (g.capacity <= 0) reason = "No teachers";
+
+    var cls = ["speak-cell"];
+    if (disabled) cls.push("disabled");
+    if (isSelected) cls.push("selected");
+    if (blocksMe) cls.push("blocked");
+    if (isFull) cls.push("full");
+
+    var onclick = disabled ? "" : "onclick=\"selectSpeak('" + g.label + "')\"";
+    var title = disabled ? ' title="' + esc(reason) + '"' : "";
+    return (
+      '<div class="' + cls.join(" ") + '"' + onclick + title + '>' +
+      '<div class="speak-time">' + g.label + '</div>' +
+      '<div class="speak-seats">' +
+      (disabled
+        ? esc(reason)
+        : '<strong>' + rem + '</strong>/' + g.capacity + ' seat' + (g.capacity === 1 ? '' : 's')) +
+      '</div>' +
+      '</div>'
+    );
+  }).join("");
+
+  var canNext = !!form.speak;
+  var progressHtml = renderProgressBar(6);
+  var summary =
+    '<div class="selected-slot-recap"><div>' +
+    '<div style="font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:3px">Main exam</div>' +
+    '<div class="recap-time">' + esc(si.label) + ' &mdash; ends ' + toHHMM(mainEnd) + '</div></div>' +
+    '<span class="recap-change" onclick="goBackToStep1()">Change</span></div>';
+
+  var hint =
+    '<div class="speak-hint">Pick a 15-min speaking slot. Greyed cells overlap your main exam, are full, or fall outside the day window. ' +
+    (teachers > 0
+      ? teachers + ' teacher' + (teachers === 1 ? '' : 's') + ' assess in parallel.'
+      : 'Speaking is currently disabled (0 teachers).') +
+    '</div>';
+
+  return (
+    progressHtml +
+    summary +
+    '<div class="section-label">Choose your speaking time</div>' +
+    hint +
+    '<div class="speak-grid">' + cells + '</div>' +
+    '<button class="btn-primary" onclick="goSpeakNext()" ' + (canNext ? "" : "disabled") + '>Continue to details</button>' +
+    '<button class="btn-secondary" onclick="goBackToStep1()">Back</button>'
+  );
+}
+
+// --- Render step 5: exam type selection (legacy — kept for old data) ---
 function renderExamType() {
   var si = SLOTS.find(function (s) {
     return s.id === form.slot;
@@ -864,55 +1076,25 @@ function renderStep2() {
     errors = {};
     return renderStep1();
   }
-  // Schedule pill and box for Main+Speaking mode
+  // Schedule recap for Main+Speaking mode — shows the picked main + speaking times.
   var schedPill = "";
   var schedBoxHtml = "";
-  if (
-    registrationMode === "main_speaking" &&
-    slotInfo.speakingEnabled &&
-    examType
-  ) {
-    schedPill =
-      examType === "main"
-        ? '<span class="recap-pill pm">Main</span>'
-        : '<span class="recap-pill ps">Speaking First</span>';
-    var sched = calcSchedule(form.slot, examType);
-    if (sched) {
-      var rows2 = "";
-      if (examType === "main") {
-        rows2 +=
-          '<div class="sched-row"><span class="sched-label">Main exam starts</span><span class="sched-val mv">' +
-          sched.mainTime +
-          "</span></div>";
-        rows2 +=
-          '<div class="sched-row"><span class="sched-label">Your speaking slot</span><span class="sched-val sv">' +
-          sched.speakTime +
-          "</span></div>";
-      } else {
-        rows2 +=
-          '<div class="sched-row"><span class="sched-label">Your speaking slot</span><span class="sched-val sv">' +
-          sched.speakTime +
-          "</span></div>";
-        rows2 +=
-          '<div class="sched-row"><span class="sched-label">Main exam starts</span><span class="sched-val mv">' +
-          sched.mainTime +
-          "</span></div>";
-      }
-      var note2 =
-        sched.teachers > 1
-          ? "Estimated. You are #" +
-            sched.pos +
-            " in the queue (" +
-            sched.teachers +
-            " teachers assessing simultaneously)."
-          : "Estimated. You are #" + sched.pos + " in the speaking queue.";
-      schedBoxHtml =
-        '<div class="sched-box"><div class="sched-title">Your schedule</div>' +
-        rows2 +
-        '<div class="sched-note">' +
-        note2 +
-        "</div></div>";
-    }
+  if (registrationMode === "main_speaking" && isMSSession(form.slot) && form.speak) {
+    var mainStart = toMin(slotInfo.label);
+    var mDur = Number(slotInfo.mainDuration) || MAIN_DURATION_DEFAULT;
+    var spkStart = toMin(form.speak);
+    var ordering = spkStart < mainStart ? "Speaking first" : "Main first";
+    schedPill = '<span class="recap-pill ' + (spkStart < mainStart ? "ps" : "pm") + '">' + ordering + '</span>';
+    schedBoxHtml =
+      '<div class="sched-box"><div class="sched-title">Your schedule</div>' +
+      '<div class="sched-row"><span class="sched-label">Main exam</span><span class="sched-val mv">' +
+      slotInfo.label + ' &ndash; ' + toHHMM(mainStart + mDur) +
+      "</span></div>" +
+      '<div class="sched-row"><span class="sched-label">Speaking slot</span><span class="sched-val sv">' +
+      form.speak + ' &ndash; ' + toHHMM(spkStart + (Number(slotInfo.speakingDuration) || SPEAK_DURATION_DEFAULT)) +
+      "</span></div>" +
+      '<div class="sched-note">All seats are guaranteed — no overlap with your main exam.</div>' +
+      "</div>";
   }
   var progressHtml = renderProgressBar(2);
   var ajSel = form.school === "adam_johns";
@@ -1045,15 +1227,7 @@ function renderManage() {
       : '<button class="btn-green" onclick="goChangeSlot()" ' +
         (submitting ? "disabled" : "") +
         ">Change my session</button>") +
-    (reg.examType && isMSSession(reg.slotId) && !isRegistrationClosed()
-      ? '<button class="btn-secondary" onclick="goChangeExamType()" ' +
-        (submitting ? "disabled" : "") +
-        ">" +
-        (reg.examType === "main"
-          ? "&#127908;&nbsp; Change to Speaking First"
-          : "&#128187;&nbsp; Change to Main Exam") +
-        "</button>"
-      : "") +
+    "" +
     (isRegistrationClosed()
       ? '<button class="btn-danger" disabled style="opacity:0.45;cursor:not-allowed">Cancel my registration</button>'
       : '<button class="btn-danger" onclick="cancelRegistration()" ' +
@@ -1074,11 +1248,8 @@ function renderChangeSlot() {
     ? '<div class="err-banner">Could not load live seat data — please refresh.</div>'
     : "";
   var cards = SLOTS.map(function (s) {
-    var rcsEt = reg && reg.examType ? reg.examType : null;
-    var rcsPoolId =
-      rcsEt === "speaking" && s.speakingEnabled ? s.id + SPEAKING_SUFFIX : s.id;
-    var rem = seats[rcsPoolId] !== undefined ? Number(seats[rcsPoolId]) : 0;
-    var slotMax = getMaxSeats(rcsPoolId);
+    var rem = seats[s.id] !== undefined ? Number(seats[s.id]) : getMaxSeats(s.id);
+    var slotMax = getMaxSeats(s.id);
     var urgentThreshold = Math.max(1, Math.ceil(slotMax * 0.2));
     var isMine = s.id === reg.slotId;
     var isFull = rem === 0 && !isMine;
@@ -1149,10 +1320,9 @@ function renderChangeSlot() {
       '</div>'
     );
   }).join("");
-  var et4c = reg.examType || null;
-  var newPool4c = poolId(newSlotChoice || "", et4c);
   var canConfirm =
-    newSlotChoice && newSlotChoice !== reg.slotId && seats[newPool4c] > 0;
+    newSlotChoice && newSlotChoice !== reg.slotId &&
+    (seats[newSlotChoice] === undefined || seats[newSlotChoice] > 0);
   return (
     errBanner +
     '<div class="change-slot-title">Change your session</div>' +
@@ -1185,6 +1355,7 @@ function render() {
     }
   }
   else if (step === 5) html = renderExamType();
+  else if (step === 6) html = renderSpeakingGrid();
   else if (step === 2) {
     html = renderStep2();
   } else if (step === 3) html = renderManage();
@@ -1283,18 +1454,37 @@ function selectNewSlot(id) {
 
 function goNext() {
   if (!form.slot) return;
-  // In MS mode, allow entry if either main OR speaking pool has seats
-  var slotAvail = isMSSession(form.slot)
-    ? seats[form.slot] > 0 || seats[form.slot + SPEAKING_SUFFIX] > 0
-    : seats[form.slot] > 0;
+  var slotAvail = seats[form.slot] === undefined ? true : seats[form.slot] > 0;
   if (!slotAvail) return;
   errors = {};
   if (isMSSession(form.slot)) {
-    step = 5;
+    form.speak = null;
+    step = 6;
   } else {
     examType = null;
     step = 2;
   }
+  render();
+}
+
+function selectSpeak(label) {
+  form.speak = form.speak === label ? null : label;
+  render();
+}
+
+function goSpeakNext() {
+  if (!form.speak || !form.slot) return;
+  // Server is authoritative — but check the pool client-side for fast feedback.
+  var pid = speakPoolId(form.speak);
+  var rem = seats[pid] !== undefined ? Number(seats[pid]) : null;
+  if (rem !== null && rem <= 0) {
+    alert("Sorry, that speaking slot just filled up. Please choose another.");
+    form.speak = null;
+    render();
+    return;
+  }
+  errors = {};
+  step = 2;
   render();
 }
 async function goToDetails() {
@@ -1348,7 +1538,7 @@ async function doExamTypeSwitch(reg, newET) {
   var slotInfo = SLOTS.find(function (s) {
     return s.id === reg.slotId;
   });
-  if (!slotInfo || !slotInfo.speakingEnabled) {
+  if (!slotInfo || !isMSSession(reg.slotId)) {
     alert("Exam type switching is not available for this session.");
     step = 3;
     render();
@@ -1456,7 +1646,7 @@ function goBack() {
     return s.id === form.slot;
   });
   if (si && isMSSession(form.slot)) {
-    step = 5;
+    step = 6;
   } else {
     examType = null;
     step = 1;
@@ -1527,13 +1717,24 @@ async function submitForm() {
     render();
     return;
   }
-  var isMS = registrationMode === "main_speaking" && !!slotInfo.speakingEnabled;
-  var et = isMS ? examType : null;
-  var pid = poolId(form.slot, et);
-  var sched = isMS && et ? calcSchedule(form.slot, et) : null;
-  if (!(seats[pid] > 0)) {
+  var isMS = registrationMode === "main_speaking" && isMSSession(form.slot);
+  if (isMS && !form.speak) {
+    step = 6;
+    render();
+    return;
+  }
+  var mainPool = form.slot;
+  var spkPool = isMS ? speakPoolId(form.speak) : null;
+  if (seats[mainPool] !== undefined && seats[mainPool] <= 0) {
     alert("Sorry, this session just filled up. Please choose another time.");
     step = 1;
+    render();
+    return;
+  }
+  if (spkPool && seats[spkPool] !== undefined && seats[spkPool] <= 0) {
+    alert("Sorry, that speaking slot just filled up. Please choose another.");
+    form.speak = null;
+    step = 6;
     render();
     return;
   }
@@ -1544,12 +1745,21 @@ async function submitForm() {
     btn.innerHTML =
       '<svg class="btn-spinner" viewBox="0 0 50 50"><circle cx="25" cy="25" r="20" fill="none" stroke-width="5"></circle></svg> Registering&hellip;';
   }
-  var seatDecremented = false;
+  var mainSeatClaimed = false;
+  var spkSeatClaimed = false;
   try {
     var schoolLabel = form.school === "adam_johns" ? "Adam & John's" : "Other";
     var cleanPhone = form.phone.replace(/\D/g, "");
-    await updateSeat(pid, -1);
-    seatDecremented = true;
+    await updateSeat(mainPool, -1);
+    mainSeatClaimed = true;
+    if (spkPool) {
+      await updateSeat(spkPool, -1);
+      spkSeatClaimed = true;
+    }
+    var mainStart = toMin(slotInfo.label);
+    var spkStart = isMS ? toMin(form.speak) : null;
+    var examTypeStr = null;
+    if (isMS) examTypeStr = spkStart < mainStart ? "Speaking" : "Main";
     var payload = {
       Timestamp: new Date().toISOString(),
       Name: form.name.trim(),
@@ -1557,10 +1767,11 @@ async function submitForm() {
       Session: sheetTime(slotInfo.label),
       School: schoolLabel,
     };
-    if (et) payload.ExamType = et === "speaking" ? "Speaking" : "Main";
-    if (sched && sched.speakTime)
-      payload.SpeakingTime = sheetTime(sched.speakTime);
-    if (sched && sched.mainTime) payload.MainTime = sheetTime(sched.mainTime);
+    if (examTypeStr) payload.ExamType = examTypeStr;
+    if (isMS) {
+      payload.SpeakingTime = sheetTime(form.speak);
+      payload.MainTime = sheetTime(slotInfo.label);
+    }
     var respData = await addRegistration(payload);
     var regData = {
       name: form.name.trim(),
@@ -1570,26 +1781,22 @@ async function submitForm() {
       school: schoolLabel,
       candidateNumber: (respData && respData.candidateNumber) || payload.CandidateNumber,
     };
-    if (et) regData.examType = et;
-    if (sched && sched.speakTime) regData.speakTime = sched.speakTime;
-    if (sched && sched.mainTime) regData.mainTime = sched.mainTime;
+    if (examTypeStr) regData.examType = examTypeStr.toLowerCase();
+    if (isMS) {
+      regData.speakTime = form.speak;
+      regData.mainTime = slotInfo.label;
+    }
     saveRegistration(regData);
     submitting = false;
     step = 3;
     render();
   } catch (err) {
     submitting = false;
-    if (seatDecremented) {
-      var slotInfo2 = SLOTS.find(function (s) {
-        return s.id === form.slot;
-      });
-      var et2 =
-        registrationMode === "main_speaking" &&
-        slotInfo2 &&
-        slotInfo2.speakingEnabled
-          ? examType
-          : null;
-      restoreOldSeat(poolId(form.slot, et2)).catch(function () {});
+    if (mainSeatClaimed) {
+      restoreOldSeat(mainPool).catch(function () {});
+    }
+    if (spkSeatClaimed && spkPool) {
+      restoreOldSeat(spkPool).catch(function () {});
     }
     var freshBtn = document.querySelector(".btn-primary");
     if (freshBtn) {
@@ -1615,13 +1822,24 @@ async function submitForm() {
 
 async function performCancellationLogic(reg) {
   if (!reg) return;
-  var et3 = reg.examType || null;
-  var pid3 = poolId(reg.slotId, et3);
+  // Always free main seat (if the session still exists).
   if (VALID_SLOT_IDS.indexOf(reg.slotId) !== -1) {
     try {
-      await restoreOldSeat(pid3);
+      await restoreOldSeat(reg.slotId);
     } catch (e) {
-      console.warn("Could not restore old seat on server cancellation (non-fatal):", e);
+      console.warn("Could not restore main seat on cancellation (non-fatal):", e);
+    }
+  }
+  // Free the speaking-grid pool for the chosen 15-min slot.
+  var speakLabel = reg.speakTime || reg.SpeakingTime || reg.speakingtime;
+  if (speakLabel) {
+    speakLabel = String(speakLabel).replace(/ \(est\.\)$/, "").trim();
+    if (/^\d{1,2}:\d{2}$/.test(speakLabel)) {
+      try {
+        await restoreOldSeat(speakPoolId(speakLabel));
+      } catch (e) {
+        console.warn("Could not restore speaking seat on cancellation (non-fatal):", e);
+      }
     }
   }
   var cancelledSlotId = reg.slotId;
@@ -1690,9 +1908,9 @@ async function confirmChangeSlot() {
   var reg = getRegistration();
   if (!reg || !newSlotChoice || newSlotChoice === reg.slotId) return;
   if (VALID_SLOT_IDS.indexOf(newSlotChoice) === -1) return;
-  var et4 = reg.examType || null;
-  var newPool = poolId(newSlotChoice, et4);
-  if (!(seats[newPool] > 0)) {
+  // Main pool capacity check (new model: main pool only at this stage).
+  var newMainPool = newSlotChoice;
+  if (seats[newMainPool] !== undefined && seats[newMainPool] <= 0) {
     alert("Sorry, that session just filled up. Please choose another.");
     render();
     return;
@@ -1700,7 +1918,6 @@ async function confirmChangeSlot() {
   submitting = true;
   render();
   var oldSlotId = reg.slotId;
-  var oldPool = poolId(oldSlotId, et4);
   var newSlotInfo = SLOTS.find(function (s) {
     return s.id === newSlotChoice;
   });
@@ -1711,60 +1928,48 @@ async function confirmChangeSlot() {
   }
   var cleanPhone = reg.phone.replace(/\D/g, "");
   var newSeatClaimed = false;
-  // Step 1: Calculate new schedule BEFORE claiming seat (myPos must be pre-claim)
-  if (
-    et4 &&
-    registrationMode === "main_speaking" &&
-    newSlotInfo.speakingEnabled
-  ) {
-    var ns4 = calcSchedule(newSlotChoice, et4);
-    if (ns4) {
-      reg.speakTime = ns4.speakTime;
-      if (et4 === "speaking") reg.mainTime = ns4.mainTime;
-      else delete reg.mainTime;
-    }
-  } else if (et4) {
-    // Moved to a session without speaking — clear stale schedule data
-    delete reg.speakTime;
-    delete reg.mainTime;
-  }
+  // Free the old speaking pool so the student can pick a fresh one for the new session.
+  var oldSpeakLabel = reg.speakTime || "";
+  oldSpeakLabel = String(oldSpeakLabel).replace(/ \(est\.\)$/, "").trim();
   try {
-    // Step 2: Claim new slot — if this fails, nothing changes
-    await updateSeat(newPool, -1);
+    await updateSeat(newMainPool, -1);
     newSeatClaimed = true;
-    // Step 3: Update sheet record with fresh times (best effort)
-    try {
-      var newSpeakT = sheetTime(reg.speakTime) || null;
-      var newMainT = sheetTime(reg.mainTime) || null;
-      await updateRegistrationSlot(
-        "998" + cleanPhone,
-        newSlotInfo.label,
-        et4,
-        newSpeakT,
-        newMainT,
-      );
-    } catch (e) {
-      /* sheet record update failed — seat still claimed, save locally */
+    if (/^\d{1,2}:\d{2}$/.test(oldSpeakLabel)) {
+      try { await restoreOldSeat(speakPoolId(oldSpeakLabel)); } catch (e) {}
     }
-    // Step 4: Restore old seat (skip if session was deleted by admin)
     try {
       if (VALID_SLOT_IDS.indexOf(oldSlotId) !== -1) {
-        await restoreOldSeat(oldPool);
+        await restoreOldSeat(oldSlotId);
       }
-    } catch (e) {
-      /* old seat restore failed — not critical, continue */
-    }
+    } catch (e) {}
+    // Clear speaking choice — the user must re-pick one valid for the new main.
+    delete reg.speakTime;
+    delete reg.mainTime;
+    delete reg.examType;
     reg.slotId = newSlotChoice;
     reg.slotLabel = newSlotInfo.label;
     saveRegistration(reg);
+    // Update sheet: clear SpeakingTime/MainTime/ExamType pending re-pick.
+    try {
+      await updateRegistrationSlot(
+        "998" + cleanPhone,
+        newSlotInfo.label,
+        null,
+        "",
+        sheetTime(newSlotInfo.label),
+      );
+    } catch (e) {}
     submitting = false;
+    var goSpeak = registrationMode === "main_speaking" && isMSSession(reg.slotId);
     newSlotChoice = null;
-    step = 3;
-    render();
-    // Recalculate old slot's speaking times (this student left that queue)
-    if (et4 && VALID_SLOT_IDS.indexOf(oldSlotId) !== -1) {
-      recalculateSpeakingTimes(oldSlotId).catch(function () {});
+    if (goSpeak) {
+      form.slot = reg.slotId;
+      form.speak = null;
+      step = 6;
+    } else {
+      step = 3;
     }
+    render();
   } catch (err) {
     submitting = false;
     if (newSeatClaimed) {
@@ -1841,6 +2046,30 @@ async function loadDeadline() {
 }
 
 // --- Session config helpers ---
+// Migrate a legacy session entry to the new schema (mainSeats/mainDuration/etc).
+function migrateLegacySession(s) {
+  var legacyId = String(s.id || "");
+  var newId = normalizeSlotId(legacyId);
+  return {
+    id: newId,
+    label: s.label,
+    period: s.period || "",
+    mainSeats: Number(s.mainSeats) || Number(s.maxSeats) || MAX,
+    mainDuration: Number(s.mainDuration) || MAIN_DURATION_DEFAULT,
+    bufferMinutes:
+      s.bufferMinutes !== undefined
+        ? Number(s.bufferMinutes)
+        : SPEAKING_GAP_DEFAULT,
+    speakingDuration: Number(s.speakingDuration) || SPEAK_DURATION_DEFAULT,
+    teachers:
+      s.teachers !== undefined
+        ? Number(s.teachers)
+        : s.speakingEnabled
+          ? 1
+          : 0,
+  };
+}
+
 async function loadSessionConfig() {
   sessionConfigError = null;
   try {
@@ -1857,34 +2086,44 @@ async function loadSessionConfig() {
         "Session config is malformed — using defaults. Check the session_config value in the Settings sheet.";
       return;
     }
-    // Apply to live state
-    SLOTS = parsed.map(function (s) {
-      return {
-        id: s.id,
-        label: s.label,
-        period: s.period || "",
-        maxSeats: Number(s.maxSeats) || MAX,
-        speakingEnabled: !!s.speakingEnabled,
-        teachers: Number(s.teachers) || 1,
-      };
-    });
+    SLOTS = parsed.map(migrateLegacySession);
     VALID_SLOT_IDS = SLOTS.map(function (s) {
       return s.id;
     });
     var newSeats = {};
     SLOTS.forEach(function (s) {
-      newSeats[s.id] = seats[s.id] !== undefined ? seats[s.id] : s.maxSeats;
-      newSeats["__max__" + s.id] = s.maxSeats;
-      if (s.speakingEnabled) {
-        var spId = s.id + SPEAKING_SUFFIX;
-        newSeats[spId] = seats[spId] !== undefined ? seats[spId] : s.maxSeats;
-        newSeats["__max__" + spId] = s.maxSeats;
+      newSeats[s.id] = seats[s.id] !== undefined ? seats[s.id] : s.mainSeats;
+      newSeats["__max__" + s.id] = s.mainSeats;
+    });
+    // Preserve any speak_* pool counts we've already loaded.
+    Object.keys(seats).forEach(function (k) {
+      if (k.indexOf("speak_") === 0 || k.indexOf("__max__speak_") === 0) {
+        newSeats[k] = seats[k];
       }
     });
     seats = newSeats;
   } catch (e) {
     sessionConfigError = "Session config error: " + e.message;
   }
+  // Day-level config
+  try {
+    var dr = await fetch(API + "/search?sheet=Settings&Key=session_day_config");
+    if (dr.ok) {
+      var drows = await dr.json();
+      if (drows && drows.length) {
+        var dv = drows[0]["Value"] || drows[0]["value"];
+        if (dv) {
+          var d = JSON.parse(dv);
+          if (d && typeof d === "object") {
+            if (d.dayStart) dayConfig.dayStart = d.dayStart;
+            if (d.dayClose) dayConfig.dayClose = d.dayClose;
+            dayConfig.dayCloseOverride = !!d.dayCloseOverride;
+          }
+        }
+      }
+    }
+  } catch (e3) {}
+  normalizeDayConfig();
   // Load registration mode
   try {
     var mr = await fetch(API + "/search?sheet=Settings&Key=registration_mode");
@@ -1898,10 +2137,32 @@ async function loadSessionConfig() {
   } catch (e2) {}
 }
 
+async function saveDayConfig(dc) {
+  var val = JSON.stringify({
+    dayStart: dc.dayStart,
+    dayClose: dc.dayClose,
+    dayCloseOverride: !!dc.dayCloseOverride,
+  });
+  var res = await fetch(API + "/Key/session_day_config?sheet=Settings", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH },
+    body: JSON.stringify({ data: { Value: val } }),
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+}
+
 function getMaxSeats(slotId) {
-  return seats["__max__" + slotId] !== undefined
-    ? seats["__max__" + slotId]
-    : MAX;
+  if (seats["__max__" + slotId] !== undefined) return seats["__max__" + slotId];
+  // Speaking pool defaults to teachers count of the first session (assumed consistent).
+  if (typeof slotId === "string" && slotId.indexOf("speak_") === 0) {
+    return SLOTS.length ? Math.max(0, Number(SLOTS[0].teachers) || 0) : 0;
+  }
+  // Main pool defaults to that session's mainSeats.
+  var s = SLOTS.find(function (sl) {
+    return sl.id === slotId;
+  });
+  if (s) return Number(s.mainSeats) || Number(s.maxSeats) || MAX;
+  return MAX;
 }
 
 async function saveSessionConfig(sessions) {
@@ -1960,21 +2221,24 @@ async function syncSeatsSheet(sessions) {
   // ── Step 2: Build the updates list ────────────────────────────────────
   var updates = [];
 
-  // Build complete desired set (base slots + speaking pools)
+  // Build complete desired set: a row per main session + one row per 15-min
+  // speaking slot in the day grid (capacity = teachers).
   var desired = [];
   sessions.forEach(function (s) {
     desired.push({
       id: s.id,
-      maxSeats: Number(s.maxSeats) || 1,
+      maxSeats: Number(s.mainSeats) || Number(s.maxSeats) || 1,
       isSpeaking: false,
     });
-    if (s.speakingEnabled) {
-      desired.push({
-        id: s.id + SPEAKING_SUFFIX,
-        maxSeats: Number(s.maxSeats) || 1,
-        isSpeaking: true,
-      });
-    }
+  });
+  var grid = buildSpeakingGrid(sessions, dayConfig);
+  grid.forEach(function (g) {
+    if (g.capacity <= 0) return; // teachers=0 → no speaking pools at all
+    desired.push({
+      id: g.poolId,
+      maxSeats: g.capacity,
+      isSpeaking: true,
+    });
   });
 
   desired.forEach(function (d) {
@@ -2308,14 +2572,16 @@ async function adminLoadStudents(force) {
   render();
 }
 
-async function adminCancelStudent(ph, sid, et) {
+async function adminCancelStudent(ph, sid, et, spk) {
   if (
     !confirm(
-      "Cancel this student? This will instantly free up their seat and recalculate queues.",
+      "Cancel this student? This will instantly free up their main and speaking seats.",
     )
   )
     return;
-  var obj = { phone: ph, slotId: sid, examType: et };
+  // performCancellationLogic reads `reg.speakTime` to release the speak_HHMM pool.
+  // Without this, the speaking slot stays decremented forever — seat leak.
+  var obj = { phone: ph, slotId: sid, examType: et, speakTime: spk || "" };
   adminStudentsLoading = true;
   render();
   try {
@@ -2347,7 +2613,14 @@ function renderAdminPanelHTML() {
     '<button class="admin-tab' +
     (adminActiveTab === "students" ? " active" : "") +
     '" onclick="adminSwitchTab(\'students\')">Students' + studentsBadge + '</button>' +
+    '<button class="admin-tab' +
+    (adminActiveTab === "bot" ? " active" : "") +
+    '" onclick="adminSwitchTab(\'bot\')">Bot</button>' +
     "</div>";
+
+  if (adminActiveTab === "bot") {
+    return renderBotTabHTML(tabs);
+  }
 
   if (adminActiveTab === "students") {
     var html =
@@ -2397,6 +2670,12 @@ function renderAdminPanelHTML() {
           var et = st.ExamType || st.examtype || null;
           if (et && et.toLowerCase() === "speaking") et = "speaking";
           else if (et && et.toLowerCase() === "main") et = "main";
+          // Pull the explicit speaking-time string so cancellation can release
+          // the right speak_HHMM pool. Strip the " (est.)" suffix here so the
+          // onclick payload is the bare HH:MM label.
+          var spk = String(st.SpeakingTime || st.speakingtime || "")
+            .replace(/ \(est\.\)$/, "")
+            .trim();
 
           return (
             '<div class="session-row" style="padding:12px;justify-content:space-between;align-items:center">' +
@@ -2408,6 +2687,7 @@ function renderAdminPanelHTML() {
             " &bull; " +
             esc(slot) +
             (et ? " &bull; " + et : "") +
+            (spk ? " &bull; speak " + esc(spk) : "") +
             "</div></div>" +
             '<button class="session-del" style="border:1px solid var(--red-border);color:var(--red);border-radius:4px;padding:4px 8px;font-size:11px;width:auto;height:auto" onclick="adminCancelStudent(\'' +
             scr(ph) +
@@ -2415,6 +2695,8 @@ function renderAdminPanelHTML() {
             scr(sid) +
             "','" +
             scr(et || "") +
+            "','" +
+            scr(spk) +
             "')\">Cancel</button>" +
             "</div>"
           );
@@ -2509,77 +2791,75 @@ function renderAdminPanelHTML() {
       return {
         id: s.id,
         label: s.label,
-        maxSeats: getMaxSeats(s.id),
+        mainSeats: s.mainSeats || getMaxSeats(s.id),
         period: s.period || "",
-        speakingEnabled: !!s.speakingEnabled,
-        teachers: s.teachers || 1,
+        mainDuration: Number(s.mainDuration) || MAIN_DURATION_DEFAULT,
+        bufferMinutes:
+          s.bufferMinutes !== undefined
+            ? Number(s.bufferMinutes)
+            : SPEAKING_GAP_DEFAULT,
+        speakingDuration: Number(s.speakingDuration) || SPEAK_DURATION_DEFAULT,
+        teachers: s.teachers !== undefined ? Number(s.teachers) : 0,
       };
     });
   adminSessionDraft = draft;
+  if (!adminDayDraft) {
+    adminDayDraft = {
+      dayStart: dayConfig.dayStart || "",
+      dayClose: dayConfig.dayClose || "",
+      dayCloseOverride: !!dayConfig.dayCloseOverride,
+    };
+  }
+
+  // Capacity preview — uses the live draft so admin sees feasibility immediately.
+  var feasibilityHtml = renderAdminFeasibility(draft, adminDayDraft);
+
+  var dayRow =
+    '<div class="session-row" style="flex-direction:column;align-items:stretch;background:rgba(255,255,255,0.02)">' +
+    '<div style="display:flex;align-items:center;gap:8px;width:100%;flex-wrap:wrap">' +
+    '<span style="font-size:11px;color:var(--muted);font-weight:600;letter-spacing:.05em;text-transform:uppercase">Day window</span>' +
+    '<span style="font-size:11px;color:var(--muted)">start</span>' +
+    '<input class="session-input" type="text" maxlength="5" placeholder="HH:MM" value="' + esc(adminDayDraft.dayStart) + '" oninput="adminUpdateDay(\'dayStart\',this.value)" style="width:64px;flex:none" />' +
+    '<span style="font-size:11px;color:var(--muted)">close</span>' +
+    '<input class="session-input" type="text" maxlength="5" placeholder="HH:MM" value="' + esc(adminDayDraft.dayClose) + '" oninput="adminUpdateDay(\'dayClose\',this.value)" ' + (adminDayDraft.dayCloseOverride ? "" : "disabled") + ' style="width:64px;flex:none;opacity:' + (adminDayDraft.dayCloseOverride ? "1" : ".55") + '" />' +
+    '<label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);cursor:pointer">' +
+    '<input type="checkbox" ' + (adminDayDraft.dayCloseOverride ? "" : "checked") + ' onchange="adminToggleDerivedClose()" /> derive close from last main</label>' +
+    '</div></div>';
 
   var rows = draft
     .map(function (s, i) {
       var canDelete = draft.length > 1;
       var topRow =
-        '<div style="display:flex;align-items:center;gap:8px;width:100%">' +
-        '<span class="session-row-num">' +
-        (i + 1) +
-        "</span>" +
-        '<input class="session-input" type="text" maxlength="8" placeholder="HH:MM" value="' +
-        esc(s.label) +
-        '" oninput="adminUpdateSession(' +
-        i +
-        ",'label',this.value)\" />" +
-        '<input class="session-input" type="text" maxlength="12" placeholder="Period" value="' +
-        esc(s.period || "") +
-        '" oninput="adminUpdateSession(' +
-        i +
-        ',\'period\',this.value)" style="width:72px;flex:none" />' +
-        '<input class="session-input seats-input" type="number" min="1" max="100" value="' +
-        s.maxSeats +
-        '" oninput="adminUpdateSession(' +
-        i +
-        ",'maxSeats',this.value)\" />" +
-        '<span style="font-size:11px;color:var(--muted);white-space:nowrap">seats</span>' +
-        (registrationMode === "main_speaking"
-          ? '<div class="tog" style="margin-left:auto" onclick="adminTogSpeak(' +
-            i +
-            ')">' +
-            '<div class="tog-track' +
-            (s.speakingEnabled ? " on" : "") +
-            '"><div class="tog-thumb"></div></div>' +
-            '<span class="tog-label">&thinsp;' +
-            (s.speakingEnabled ? "M+S" : "L+R") +
-            "</span>" +
-            "</div>"
-          : "") +
-        '<button class="session-del" onclick="adminDeleteSession(' +
-        i +
-        ')" ' +
-        (canDelete ? "" : "disabled") +
-        ">&#215;</button>" +
+        '<div style="display:flex;align-items:center;gap:8px;width:100%;flex-wrap:wrap">' +
+        '<span class="session-row-num">' + (i + 1) + "</span>" +
+        '<input class="session-input" type="text" maxlength="8" placeholder="HH:MM" value="' + esc(s.label) + '" oninput="adminUpdateSession(' + i + ",'label',this.value)\" />" +
+        '<input class="session-input" type="text" maxlength="12" placeholder="Period" value="' + esc(s.period || "") + '" oninput="adminUpdateSession(' + i + ',\'period\',this.value)" style="width:72px;flex:none" />' +
+        '<input class="session-input seats-input" type="number" min="1" max="200" value="' + s.mainSeats + '" oninput="adminUpdateSession(' + i + ",'mainSeats',this.value)\" />" +
+        '<span style="font-size:11px;color:var(--muted);white-space:nowrap">main seats</span>' +
+        '<button class="session-del" onclick="adminDeleteSession(' + i + ')" ' + (canDelete ? "" : "disabled") + ">&#215;</button>" +
         "</div>";
-      var speakRow =
-        registrationMode === "main_speaking" && s.speakingEnabled
-          ? '<div style="display:flex;align-items:center;gap:8px;padding-top:8px;margin-top:8px;border-top:1px solid var(--border)">' +
-            '<span style="font-size:11px;color:var(--speak);font-weight:600;min-width:20px">&#127908;</span>' +
-            '<span style="font-size:12px;color:var(--muted);flex:1">Speaking teachers:</span>' +
-            '<input class="session-input teach-input" type="number" min="1" max="10" value="' +
-            (s.teachers || 1) +
-            '" oninput="adminUpdateSession(' +
-            i +
-            ",'teachers',+this.value||1)\" />" +
-            '<span style="font-size:11px;color:var(--muted);white-space:nowrap">teacher' +
-            ((s.teachers || 1) === 1 ? "" : "s") +
-            " assessing in parallel</span>" +
-            "</div>"
-          : "";
+      var detailRow =
+        '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-top:8px;margin-top:8px;border-top:1px solid var(--border)">' +
+        '<span style="font-size:11px;color:var(--muted)">Main duration</span>' +
+        '<input class="session-input" type="number" min="15" max="600" value="' + s.mainDuration + '" oninput="adminUpdateSession(' + i + ",'mainDuration',this.value)\" style=\"width:72px\" />" +
+        '<span style="font-size:11px;color:var(--muted)">min · buffer</span>' +
+        '<input class="session-input" type="number" min="0" max="120" value="' + s.bufferMinutes + '" oninput="adminUpdateSession(' + i + ",'bufferMinutes',this.value)\" style=\"width:60px\" />" +
+        '<span style="font-size:11px;color:var(--muted)">min</span>' +
+        '</div>' +
+        (registrationMode === "main_speaking"
+          ? '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-top:8px;margin-top:8px;border-top:1px dashed var(--border)">' +
+            '<span style="font-size:11px;color:var(--speak);font-weight:600">&#127908; Speaking</span>' +
+            '<span style="font-size:11px;color:var(--muted)">slot length</span>' +
+            '<input class="session-input" type="number" min="5" max="60" value="' + s.speakingDuration + '" oninput="adminUpdateSession(' + i + ",'speakingDuration',this.value)\" style=\"width:60px\" />" +
+            '<span style="font-size:11px;color:var(--muted)">min · teachers</span>' +
+            '<input class="session-input teach-input" type="number" min="0" max="20" value="' + s.teachers + '" oninput="adminUpdateSession(' + i + ",'teachers',this.value)\" />" +
+            '<span style="font-size:11px;color:var(--muted)">(0 disables speaking)</span>' +
+            '</div>'
+          : "");
       return (
-        '<div class="session-row" id="srow-' +
-        i +
-        '" style="flex-direction:column;align-items:stretch">' +
+        '<div class="session-row" id="srow-' + i + '" style="flex-direction:column;align-items:stretch">' +
         topRow +
-        speakRow +
+        detailRow +
         "</div>"
       );
     })
@@ -2589,67 +2869,203 @@ function renderAdminPanelHTML() {
     '<div class="admin-panel">' +
     '<div class="admin-title">Settings</div>' +
     tabs +
-    '<div style="font-size:12px;color:var(--muted);margin-bottom:12px">Edit session times and seat limits. Changes apply immediately for new registrations.</div>' +
+    '<div style="font-size:12px;color:var(--muted);margin-bottom:12px">Edit session times, capacity, and durations. The speaking grid is generated automatically from these settings.</div>' +
+    dayRow +
     rows +
     '<button class="add-session-btn" onclick="adminAddSession()">+ Add session</button>' +
-    (registrationMode === "main_speaking"
-      ? '<button class="enable-all-btn" onclick="adminTogAllSpeak()">' +
-        (draft.every(function (s) {
-          return s.speakingEnabled;
-        })
-          ? "Disable speaking for all"
-          : "Enable speaking for all") +
-        "</button>"
-      : "") +
+    feasibilityHtml +
     '<div id="admin-sessions-status" class="admin-status"></div>' +
     '<button class="btn-primary" style="margin-top:12px" onclick="adminSaveSessions()">Save sessions</button>' +
-    '<button class="btn-secondary" onclick="adminSessionDraft=null;render()">Discard changes</button>' +
+    '<button class="btn-secondary" onclick="adminSessionDraft=null;adminDayDraft=null;render()">Discard changes</button>' +
     '<button class="btn-secondary" onclick="closeAdmin()">Close</button>' +
     '<button class="btn-secondary" style="margin-top:4px;color:var(--red);border-color:var(--red-border)" onclick="adminLogout()">Log out</button>' +
     "</div>"
   );
 }
 
+// Compute and render a capacity feasibility report for the admin's draft.
+function renderAdminFeasibility(draft, dc) {
+  // Convert draft sessions into the runtime shape used by buildSpeakingGrid.
+  var sessions = draft.map(function (s) {
+    return {
+      id: s.id,
+      label: s.label,
+      mainSeats: Number(s.mainSeats) || 0,
+      mainDuration: Number(s.mainDuration) || MAIN_DURATION_DEFAULT,
+      bufferMinutes:
+        s.bufferMinutes !== undefined
+          ? Number(s.bufferMinutes)
+          : SPEAKING_GAP_DEFAULT,
+      speakingDuration: Number(s.speakingDuration) || SPEAK_DURATION_DEFAULT,
+      teachers: Number(s.teachers) || 0,
+    };
+  });
+  // Day config: honor the override; otherwise derive from sessions.
+  var dcEff = { dayStart: dc.dayStart, dayClose: dc.dayClose, dayCloseOverride: dc.dayCloseOverride };
+  if (!dcEff.dayCloseOverride && sessions.length) {
+    var sorted = sessions.slice().sort(function (a, b) {
+      return toMin(a.label) - toMin(b.label);
+    });
+    var lastEnd = 0;
+    sorted.forEach(function (s) {
+      var e = toMin(s.label) + (Number(s.mainDuration) || MAIN_DURATION_DEFAULT);
+      if (e > lastEnd) lastEnd = e;
+    });
+    dcEff.dayClose = toHHMM(lastEnd);
+    if (!dcEff.dayStart) dcEff.dayStart = toHHMM(toMin(sorted[0].label));
+  }
+
+  // Validation: teachers and speakingDuration consistency.
+  var warnings = [];
+  if (sessions.length) {
+    var t0 = sessions[0].teachers;
+    var d0 = sessions[0].speakingDuration;
+    var teachersAgree = sessions.every(function (s) { return s.teachers === t0; });
+    var durAgree = sessions.every(function (s) { return s.speakingDuration === d0; });
+    if (!teachersAgree) warnings.push("Teachers count differs between sessions — speaking grid uses the first session's value.");
+    if (!durAgree) warnings.push("Speaking duration differs between sessions — grid uses the first session's value.");
+  }
+
+  var grid = buildSpeakingGrid(sessions, dcEff);
+  // Per-session reachable seats:
+  var perSession = sessions.map(function (s) {
+    var validCount = grid.filter(function (g) {
+      return g.capacity > 0 && g.blockedByMain.indexOf(s.id) === -1;
+    }).length;
+    var reachable = validCount * (Number(sessions[0].teachers) || 0);
+    var ok = reachable >= s.mainSeats;
+    return { session: s, validSlots: validCount, reachable: reachable, ok: ok };
+  });
+
+  var totalMain = sessions.reduce(function (a, s) { return a + s.mainSeats; }, 0);
+  var totalSpeak = grid.filter(function (g) { return g.capacity > 0; }).length * (sessions[0] ? sessions[0].teachers || 0 : 0);
+
+  var rowsHtml = perSession.map(function (p) {
+    var color = p.ok ? "#3dbd8b" : "#e05a5a";
+    return (
+      '<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0">' +
+      '<span>' + esc(p.session.label) + '</span>' +
+      '<span style="color:' + color + '">' +
+      p.reachable + ' speaking seats reachable / ' + p.session.mainSeats + ' main' +
+      (p.ok ? "" : " &mdash; INSUFFICIENT") +
+      '</span></div>'
+    );
+  }).join("");
+
+  var warnHtml = warnings.map(function (w) {
+    return '<div style="font-size:11px;color:#BA7517;margin-top:4px">&#9888; ' + esc(w) + '</div>';
+  }).join("");
+
+  var anyBad = perSession.some(function (p) { return !p.ok; });
+  var headerColor = anyBad ? "#e05a5a" : "#3dbd8b";
+
+  return (
+    '<div style="margin-top:12px;padding:10px 12px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px">' +
+    '<div style="font-size:12px;font-weight:600;color:' + headerColor + ';margin-bottom:6px">Capacity preview &mdash; ' +
+    totalMain + ' main seats, ' + totalSpeak + ' speaking seats (' + grid.length + ' grid cells)</div>' +
+    rowsHtml +
+    warnHtml +
+    (anyBad
+      ? '<div style="font-size:11px;color:#e05a5a;margin-top:6px">Some sessions cannot guarantee a speaking seat for every student. Add teachers, widen the day window, or reduce main seats.</div>'
+      : '') +
+    '</div>'
+  );
+}
+
 function adminSwitchTab(tab) {
   adminActiveTab = tab;
-  if (tab === "sessions")
+  if (tab === "sessions") {
     adminSessionDraft =
       adminSessionDraft ||
       SLOTS.map(function (s) {
         return {
           id: s.id,
           label: s.label,
-          maxSeats: getMaxSeats(s.id),
+          mainSeats: s.mainSeats || getMaxSeats(s.id),
           period: s.period || "",
-          speakingEnabled: !!s.speakingEnabled,
-          teachers: s.teachers || 1,
+          mainDuration: Number(s.mainDuration) || MAIN_DURATION_DEFAULT,
+          bufferMinutes:
+            s.bufferMinutes !== undefined
+              ? Number(s.bufferMinutes)
+              : SPEAKING_GAP_DEFAULT,
+          speakingDuration: Number(s.speakingDuration) || SPEAK_DURATION_DEFAULT,
+          teachers: s.teachers !== undefined ? Number(s.teachers) : 0,
         };
       });
+    adminDayDraft = adminDayDraft || {
+      dayStart: dayConfig.dayStart || "",
+      dayClose: dayConfig.dayClose || "",
+      dayCloseOverride: !!dayConfig.dayCloseOverride,
+    };
+  }
   if (tab === "students") adminLoadStudents();
+  if (tab === "bot") {
+    // Load whichever sub-tab is active so the user sees data immediately.
+    if (adminBotSubtab === "texts" && !adminBotTexts) adminBotLoadTexts();
+    if (adminBotSubtab === "schedules" && !adminBotSchedulesLoaded) adminBotLoadSchedules();
+    if (adminBotSubtab === "broadcast" && !adminBotBroadcastHistory) adminBotLoadHistory();
+    if (adminBotSubtab === "stats") adminBotLoadStats();
+  } else {
+    // Leaving the Bot tab — stop any background polling.
+    adminBotStopPolling();
+  }
   render();
 }
 
-function adminUpdateSession(index, field, value) {
-  if (!adminSessionDraft) return;
-  adminSessionDraft[index][field] =
-    (field === "maxSeats" || field === "teachers") && value !== ""
-      ? Number(value) || 1
-      : value;
-}
-function adminTogSpeak(index) {
-  if (!adminSessionDraft) return;
-  adminSessionDraft[index].speakingEnabled =
-    !adminSessionDraft[index].speakingEnabled;
+function adminBotSwitchSubtab(sub) {
+  adminBotSubtab = sub;
+  if (sub === "texts" && !adminBotTexts) adminBotLoadTexts();
+  if (sub === "schedules" && !adminBotSchedulesLoaded) adminBotLoadSchedules();
+  if (sub === "broadcast" && !adminBotBroadcastHistory) adminBotLoadHistory();
+  if (sub === "stats") adminBotLoadStats();
+  if (sub !== "stats") adminBotStopPolling();
   render();
 }
-function adminTogAllSpeak() {
+
+var ADMIN_NUMERIC_FIELDS = {
+  mainSeats: 1,
+  mainDuration: 1,
+  bufferMinutes: 1,
+  speakingDuration: 1,
+  teachers: 1,
+};
+function adminUpdateSession(index, field, value) {
   if (!adminSessionDraft) return;
-  var allOn = adminSessionDraft.every(function (s) {
-    return s.speakingEnabled;
-  });
-  adminSessionDraft.forEach(function (s) {
-    s.speakingEnabled = !allOn;
-  });
+  if (ADMIN_NUMERIC_FIELDS[field]) {
+    if (value === "" || value === null) {
+      adminSessionDraft[index][field] = field === "teachers" || field === "bufferMinutes" ? 0 : 1;
+    } else {
+      adminSessionDraft[index][field] = Number(value);
+    }
+    // Re-render so the capacity preview updates live.
+    render();
+  } else {
+    adminSessionDraft[index][field] = value;
+    // Re-render label/period changes too — they affect the grid.
+    if (field === "label") render();
+  }
+}
+
+function adminUpdateDay(field, value) {
+  if (!adminDayDraft) return;
+  adminDayDraft[field] = value;
+  render();
+}
+function adminToggleDerivedClose() {
+  if (!adminDayDraft) return;
+  adminDayDraft.dayCloseOverride = !adminDayDraft.dayCloseOverride;
+  if (!adminDayDraft.dayCloseOverride) {
+    // Recompute close from sessions
+    var sorted = (adminSessionDraft || []).slice().sort(function (a, b) {
+      return toMin(a.label) - toMin(b.label);
+    });
+    var lastEnd = 0;
+    sorted.forEach(function (s) {
+      var e = toMin(s.label) + (Number(s.mainDuration) || MAIN_DURATION_DEFAULT);
+      if (e > lastEnd) lastEnd = e;
+    });
+    if (lastEnd) adminDayDraft.dayClose = toHHMM(lastEnd);
+  }
   render();
 }
 async function adminSetMode(mode) {
@@ -2676,25 +3092,32 @@ async function adminSetMode(mode) {
 }
 
 function adminAddSession() {
-  if (!adminSessionDraft)
+  if (!adminSessionDraft) {
     adminSessionDraft = SLOTS.map(function (s) {
       return {
         id: s.id,
         label: s.label,
-        maxSeats: getMaxSeats(s.id),
+        mainSeats: s.mainSeats || getMaxSeats(s.id),
         period: s.period || "",
-        speakingEnabled: !!s.speakingEnabled,
-        teachers: s.teachers || 1,
+        mainDuration: Number(s.mainDuration) || MAIN_DURATION_DEFAULT,
+        bufferMinutes: s.bufferMinutes !== undefined ? Number(s.bufferMinutes) : SPEAKING_GAP_DEFAULT,
+        speakingDuration: Number(s.speakingDuration) || SPEAK_DURATION_DEFAULT,
+        teachers: s.teachers !== undefined ? Number(s.teachers) : 0,
       };
     });
-  var newId = "slot_custom_" + Date.now();
+  }
+  var newId = "main_custom_" + Date.now();
+  // Inherit speaking config from an existing row so the grid stays coherent.
+  var template = adminSessionDraft[0] || {};
   adminSessionDraft.push({
     id: newId,
     label: "00:00",
-    maxSeats: 10,
+    mainSeats: 10,
     period: "",
-    speakingEnabled: false,
-    teachers: 1,
+    mainDuration: Number(template.mainDuration) || MAIN_DURATION_DEFAULT,
+    bufferMinutes: template.bufferMinutes !== undefined ? Number(template.bufferMinutes) : SPEAKING_GAP_DEFAULT,
+    speakingDuration: Number(template.speakingDuration) || SPEAK_DURATION_DEFAULT,
+    teachers: template.teachers !== undefined ? Number(template.teachers) : 0,
   });
   render();
 }
@@ -2709,21 +3132,28 @@ async function adminSaveSessions() {
   var draft = adminSessionDraft;
   if (!draft || !draft.length) return;
 
-  // Validate all time labels
   var statusEl = document.getElementById("admin-sessions-status");
   for (var i = 0; i < draft.length; i++) {
-    var lbl = draft[i].label.trim();
-    if (!lbl) {
+    var lbl = (draft[i].label || "").trim();
+    if (!/^\d{1,2}:\d{2}$/.test(lbl)) {
       if (statusEl) {
-        statusEl.textContent = "Session " + (i + 1) + " needs a time label.";
+        statusEl.textContent = "Session " + (i + 1) + ": time must be HH:MM.";
         statusEl.className = "admin-status err";
       }
       return;
     }
-    var seatsVal = Number(draft[i].maxSeats);
-    if (!seatsVal || seatsVal < 1 || seatsVal > 100) {
+    var seatsVal = Number(draft[i].mainSeats);
+    if (!seatsVal || seatsVal < 1 || seatsVal > 200) {
       if (statusEl) {
-        statusEl.textContent = "Session " + (i + 1) + ": seats must be 1–100.";
+        statusEl.textContent = "Session " + (i + 1) + ": main seats must be 1–200.";
+        statusEl.className = "admin-status err";
+      }
+      return;
+    }
+    var mDur = Number(draft[i].mainDuration);
+    if (!mDur || mDur < 15) {
+      if (statusEl) {
+        statusEl.textContent = "Session " + (i + 1) + ": main duration must be ≥ 15 min.";
         statusEl.className = "admin-status err";
       }
       return;
@@ -2738,7 +3168,6 @@ async function adminSaveSessions() {
   }
 
   try {
-    // Save config to Settings sheet
     var configToSave = draft.map(function (s) {
       var existingSlot = SLOTS.find(function (sl) {
         return sl.id === s.id;
@@ -2746,42 +3175,50 @@ async function adminSaveSessions() {
       return {
         id: s.id,
         label: s.label,
-        maxSeats: Number(s.maxSeats) || 1,
-        period:
-          s.period !== undefined
-            ? s.period
-            : existingSlot
-              ? existingSlot.period || ""
-              : "",
-        speakingEnabled: !!s.speakingEnabled,
-        teachers: Number(s.teachers) || 1,
+        period: s.period !== undefined ? s.period : existingSlot ? existingSlot.period || "" : "",
+        mainSeats: Number(s.mainSeats) || 1,
+        mainDuration: Number(s.mainDuration) || MAIN_DURATION_DEFAULT,
+        bufferMinutes: s.bufferMinutes !== undefined ? Number(s.bufferMinutes) : SPEAKING_GAP_DEFAULT,
+        speakingDuration: Number(s.speakingDuration) || SPEAK_DURATION_DEFAULT,
+        teachers: Number(s.teachers) || 0,
       };
     });
     await saveSessionConfig(configToSave);
+    if (adminDayDraft) {
+      try {
+        await saveDayConfig(adminDayDraft);
+        dayConfig.dayStart = adminDayDraft.dayStart;
+        dayConfig.dayClose = adminDayDraft.dayClose;
+        dayConfig.dayCloseOverride = !!adminDayDraft.dayCloseOverride;
+      } catch (e) {
+        console.warn("Day config save failed (non-fatal):", e);
+      }
+    }
 
-    // Sync Seats sheet — live-fetches current sheet state to decide POST vs PATCH vs DELETE
-    await syncSeatsSheet(configToSave);
-
-    // Apply to live state — include maxSeats so period/maxSeats survive across saves
+    // Apply to live state before syncing Seats so buildSpeakingGrid uses fresh data.
     SLOTS = configToSave.map(function (s) {
       return {
         id: s.id,
         label: s.label,
         period: s.period || "",
-        maxSeats: s.maxSeats,
-        speakingEnabled: !!s.speakingEnabled,
-        teachers: Number(s.teachers) || 1,
+        mainSeats: s.mainSeats,
+        mainDuration: s.mainDuration,
+        bufferMinutes: s.bufferMinutes,
+        speakingDuration: s.speakingDuration,
+        teachers: s.teachers,
       };
     });
     VALID_SLOT_IDS = SLOTS.map(function (s) {
       return s.id;
     });
+    normalizeDayConfig();
     configToSave.forEach(function (s) {
-      seats["__max__" + s.id] = s.maxSeats;
-      if (s.speakingEnabled)
-        seats["__max__" + s.id + SPEAKING_SUFFIX] = s.maxSeats;
+      seats["__max__" + s.id] = s.mainSeats;
     });
+    // Re-provision Seats sheet with main pools + speaking grid pools.
+    await syncSeatsSheet(SLOTS);
     adminSessionDraft = null;
+    adminDayDraft = null;
 
     if (statusEl) {
       statusEl.textContent = "Sessions saved successfully!";
@@ -2950,6 +3387,452 @@ function initTheme() {
       }
     });
   }
+}
+
+// ============================================================
+// BOT ADMIN TAB
+// ============================================================
+
+function renderBotTabHTML(tabs) {
+  var subtabs =
+    '<div class="admin-tabs" style="margin-bottom:14px">' +
+    ['texts', 'broadcast', 'schedules', 'stats'].map(function (s) {
+      var label = s.charAt(0).toUpperCase() + s.slice(1);
+      return '<button class="admin-tab' + (adminBotSubtab === s ? ' active' : '') +
+        '" onclick="adminBotSwitchSubtab(\'' + s + '\')">' + label + '</button>';
+    }).join('') +
+    '</div>';
+
+  var body = "";
+  if (adminBotSubtab === "texts") body = renderBotTexts();
+  else if (adminBotSubtab === "broadcast") body = renderBotBroadcast();
+  else if (adminBotSubtab === "schedules") body = renderBotSchedules();
+  else if (adminBotSubtab === "stats") body = renderBotStats();
+
+  return (
+    '<div class="admin-panel" style="max-width:680px">' +
+    '<div class="admin-title">Bot</div>' +
+    tabs +
+    subtabs +
+    body +
+    '<button class="btn-secondary" onclick="closeAdmin()">Close</button>' +
+    '<button class="btn-secondary" style="margin-top:4px;color:var(--red);border-color:var(--red-border)" onclick="adminLogout()">Log out</button>' +
+    '</div>'
+  );
+}
+
+// ---- TEXTS ----
+async function adminBotLoadTexts() {
+  adminBotTextsLoading = true;
+  adminBotTextsError = "";
+  render();
+  var loaded = {};
+  try {
+    // Fetch each key — small N, parallel.
+    await Promise.all(BOT_TEXT_FIELDS.map(async function (f) {
+      try {
+        var r = await fetch(API + "/search?sheet=Settings&Key=" + encodeURIComponent(f.key));
+        if (r.ok) {
+          var rows = await r.json();
+          if (rows && rows.length) {
+            var v = rows[0].Value !== undefined ? rows[0].Value : rows[0].value;
+            if (typeof v === "string" && v.length) loaded[f.key] = v;
+          }
+        }
+      } catch (e) {}
+    }));
+    adminBotTexts = loaded;
+  } catch (e) {
+    adminBotTextsError = e.message;
+  }
+  adminBotTextsLoading = false;
+  render();
+}
+
+function renderBotTexts() {
+  if (adminBotTextsLoading) {
+    return '<div style="font-size:12px;color:var(--muted);padding:20px 0;text-align:center">Loading…</div>';
+  }
+  if (adminBotTextsError) {
+    return '<div class="err-banner">' + esc(adminBotTextsError) + '</div>';
+  }
+  var t = adminBotTexts || {};
+  var rows = BOT_TEXT_FIELDS.map(function (f) {
+    var val = t[f.key] !== undefined ? t[f.key] : "";
+    var placeholder = "Uses built-in default if left empty";
+    return (
+      '<div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:10px">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">' +
+      '<label style="font-size:13px;font-weight:600">' + esc(f.label) + '</label>' +
+      '<code style="font-size:11px;color:var(--muted)">' + esc(f.key) + '</code>' +
+      '</div>' +
+      '<textarea id="bot-text-' + f.key + '" class="admin-input" rows="' + f.rows + '" placeholder="' + esc(placeholder) + '" ' +
+      'style="font-family:inherit;font-size:13px;resize:vertical;width:100%;box-sizing:border-box">' + esc(val) + '</textarea>' +
+      '<div style="display:flex;gap:8px;margin-top:6px">' +
+      '<button class="btn-primary" style="margin:0;padding:6px 12px;font-size:12px" onclick="adminBotSaveText(\'' + f.key + '\')">Save</button>' +
+      (val ? '<button class="btn-secondary" style="margin:0;padding:6px 12px;font-size:12px" onclick="adminBotResetText(\'' + f.key + '\')">Reset to default</button>' : '') +
+      '<span id="bot-text-status-' + f.key + '" class="admin-status" style="font-size:11px"></span>' +
+      '</div></div>'
+    );
+  }).join("");
+  return (
+    '<div style="font-size:12px;color:var(--muted);margin-bottom:12px">' +
+    'Edit the bot\'s static texts. HTML tags like &lt;b&gt;, &lt;i&gt;, &lt;a&gt; are allowed. ' +
+    'Leave a field empty to fall back to the built-in default. ' +
+    'Tokens: <code>{name}</code> in reminder header; <code>{alarm}</code> in reminder tips.' +
+    '</div>' + rows
+  );
+}
+
+async function adminBotSaveText(key) {
+  var el = document.getElementById("bot-text-" + key);
+  if (!el) return;
+  var val = el.value;
+  var statusEl = document.getElementById("bot-text-status-" + key);
+  if (statusEl) { statusEl.textContent = "Saving…"; statusEl.className = "admin-status"; }
+  try {
+    var res = await fetch(API + "/Key/" + encodeURIComponent(key) + "?sheet=Settings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH },
+      body: JSON.stringify({ data: { Value: val } }),
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    if (!adminBotTexts) adminBotTexts = {};
+    if (val) adminBotTexts[key] = val; else delete adminBotTexts[key];
+    if (statusEl) { statusEl.textContent = "✓ Saved"; statusEl.className = "admin-status ok"; }
+    showToast("Saved " + key, "success");
+  } catch (e) {
+    if (statusEl) { statusEl.textContent = "Save failed: " + e.message; statusEl.className = "admin-status err"; }
+  }
+}
+
+async function adminBotResetText(key) {
+  if (!confirm("Clear this override? The bot will fall back to the built-in default text.")) return;
+  var el = document.getElementById("bot-text-" + key);
+  if (el) el.value = "";
+  await adminBotSaveText(key);
+  render();
+}
+
+// ---- BROADCAST ----
+async function adminBotLoadHistory() {
+  try {
+    var res = await fetch(API + "/admin/broadcasts", { headers: { "X-Admin-Hash": ADMIN_HASH } });
+    if (res.ok) adminBotBroadcastHistory = await res.json();
+  } catch (e) {
+    adminBotBroadcastHistory = [];
+  }
+  render();
+}
+
+function renderBotBroadcast() {
+  var bcast = adminBotActiveBroadcast;
+  var inFlight = bcast && bcast.status !== "done";
+
+  var progressHtml = "";
+  if (bcast) {
+    var pct = bcast.recipients && bcast.recipients.length
+      ? Math.round((bcast.cursor / bcast.recipients.length) * 100)
+      : 0;
+    var failedHtml = "";
+    if (bcast.failed && bcast.failed.length) {
+      failedHtml =
+        '<div style="font-size:11px;color:#e05a5a;margin-top:6px">' +
+        bcast.failed.length + ' failed: ' +
+        bcast.failed.slice(0, 3).map(function (f) { return esc(String(f.chatId)); }).join(", ") +
+        (bcast.failed.length > 3 ? '…' : '') +
+        '</div>' +
+        '<button class="btn-secondary" style="margin-top:6px;padding:6px 12px;font-size:12px" onclick="adminBotRetryFailed()">Retry failed (' + bcast.failed.length + ')</button>';
+    }
+    progressHtml =
+      '<div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:14px">' +
+      '<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:6px">' +
+      '<span>Status: <b>' + esc(bcast.status) + '</b></span>' +
+      '<span>' + bcast.sent.length + ' sent · ' + bcast.failed.length + ' failed · ' + bcast.recipients.length + ' total</span>' +
+      '</div>' +
+      '<div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden">' +
+      '<div style="width:' + pct + '%;height:100%;background:var(--primary);transition:width .3s"></div>' +
+      '</div>' +
+      failedHtml +
+      '</div>';
+  }
+
+  var historyHtml = "";
+  if (adminBotBroadcastHistory && adminBotBroadcastHistory.length) {
+    historyHtml = '<div style="font-size:11px;font-weight:600;color:var(--muted);margin:14px 0 6px;letter-spacing:.05em;text-transform:uppercase">Recent broadcasts</div>';
+    historyHtml += adminBotBroadcastHistory.map(function (h) {
+      return (
+        '<div style="font-size:12px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px">' +
+        '<div style="display:flex;justify-content:space-between"><span><b>' + esc(h.status) + '</b> · ' + h.sent + '/' + h.recipientCount + ' sent' + (h.failed ? ' · ' + h.failed + ' failed' : '') + '</span>' +
+        '<span style="color:var(--muted);font-size:11px">' + esc(String(h.createdAt).slice(0, 16).replace('T', ' ')) + '</span></div>' +
+        '<div style="font-size:11px;color:var(--muted);margin-top:3px">' + esc(h.text) + '</div>' +
+        '</div>'
+      );
+    }).join("");
+  }
+
+  return (
+    '<div style="font-size:12px;color:var(--muted);margin-bottom:10px">' +
+    'Compose a one-off broadcast to all linked Telegram users. HTML tags allowed. ' +
+    'Audience filters (per session/exam type/school) are wired but UI is TODO — ships with "all linked".' +
+    '</div>' +
+    '<textarea id="bot-broadcast-text" class="admin-input" rows="6" placeholder="Type your message…" ' +
+    'style="font-family:inherit;font-size:13px;resize:vertical;width:100%;box-sizing:border-box" ' +
+    'oninput="adminBotBroadcastText=this.value">' + esc(adminBotBroadcastText) + '</textarea>' +
+    '<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">' +
+    '<button class="btn-secondary" style="margin:0;padding:8px 14px;font-size:12px" onclick="adminBotBroadcastPreview()">Preview to me only</button>' +
+    '<button class="btn-primary" style="margin:0;padding:8px 14px;font-size:12px" onclick="adminBotBroadcastSend()" ' + (inFlight ? 'disabled' : '') + '>Send to all linked users</button>' +
+    '<span id="bot-broadcast-status" class="admin-status" style="font-size:11px;align-self:center"></span>' +
+    '</div>' +
+    '<div style="margin-top:14px">' + progressHtml + '</div>' +
+    historyHtml
+  );
+}
+
+async function adminBotBroadcastPreview() {
+  var txt = String(adminBotBroadcastText || "").trim();
+  if (!txt) { showToast("Type a message first", "info"); return; }
+  var statusEl = document.getElementById("bot-broadcast-status");
+  if (statusEl) { statusEl.textContent = "Sending preview…"; statusEl.className = "admin-status"; }
+  try {
+    var res = await fetch(API + "/admin/broadcast/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH },
+      body: JSON.stringify({ text: txt }),
+    });
+    var data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || "HTTP " + res.status);
+    if (statusEl) { statusEl.textContent = "✓ Preview sent to your Telegram"; statusEl.className = "admin-status ok"; }
+  } catch (e) {
+    if (statusEl) { statusEl.textContent = "Preview failed: " + e.message; statusEl.className = "admin-status err"; }
+  }
+}
+
+async function adminBotBroadcastSend() {
+  var txt = String(adminBotBroadcastText || "").trim();
+  if (!txt) { showToast("Type a message first", "info"); return; }
+  // Confirm-with-count step.
+  var count = 0;
+  try {
+    var pr = await fetch(API + "/admin/broadcast-preview-count?audience=" + encodeURIComponent(JSON.stringify(adminBotBroadcastAudience)), { headers: { "X-Admin-Hash": ADMIN_HASH } });
+    if (pr.ok) { var pd = await pr.json(); count = pd.count || 0; }
+  } catch (e) {}
+  if (!confirm("Send this message to " + count + " linked users?")) return;
+  var statusEl = document.getElementById("bot-broadcast-status");
+  if (statusEl) { statusEl.textContent = "Starting…"; statusEl.className = "admin-status"; }
+  try {
+    var res = await fetch(API + "/admin/broadcast", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH },
+      body: JSON.stringify({ text: txt, audience: adminBotBroadcastAudience }),
+    });
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.error || "HTTP " + res.status);
+    adminBotActiveBroadcastId = data.id;
+    adminBotBroadcastText = "";
+    if (statusEl) { statusEl.textContent = "Queued " + data.recipients + " recipients"; statusEl.className = "admin-status ok"; }
+    adminBotStartPolling();
+    adminBotLoadHistory();
+  } catch (e) {
+    if (statusEl) { statusEl.textContent = "Send failed: " + e.message; statusEl.className = "admin-status err"; }
+  }
+}
+
+async function adminBotRetryFailed() {
+  if (!adminBotActiveBroadcastId) return;
+  try {
+    var res = await fetch(API + "/admin/broadcast/" + adminBotActiveBroadcastId + "/retry-failed", {
+      method: "POST",
+      headers: { "X-Admin-Hash": ADMIN_HASH },
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    adminBotStartPolling();
+    showToast("Retry queued", "success");
+  } catch (e) {
+    showToast("Retry failed: " + e.message, "error");
+  }
+}
+
+function adminBotStartPolling() {
+  adminBotBroadcastPolling = true;
+  (function tick() {
+    if (!adminBotBroadcastPolling || !adminBotActiveBroadcastId) return;
+    fetch(API + "/admin/broadcast/" + adminBotActiveBroadcastId, { headers: { "X-Admin-Hash": ADMIN_HASH } })
+      .then(function (r) { return r.json(); })
+      .then(function (rec) {
+        adminBotActiveBroadcast = rec;
+        if (adminBotSubtab === "broadcast" && adminActiveTab === "bot") render();
+        if (rec && rec.status !== "done") {
+          setTimeout(tick, 2000);
+        } else {
+          adminBotBroadcastPolling = false;
+          adminBotLoadHistory();
+        }
+      })
+      .catch(function () { setTimeout(tick, 4000); });
+  })();
+}
+
+function adminBotStopPolling() {
+  adminBotBroadcastPolling = false;
+  if (adminBotStatsTimer) { clearInterval(adminBotStatsTimer); adminBotStatsTimer = null; }
+}
+
+// ---- SCHEDULES ----
+async function adminBotLoadSchedules() {
+  try {
+    var res = await fetch(API + "/search?sheet=Settings&Key=bot_schedules");
+    if (res.ok) {
+      var rows = await res.json();
+      if (rows && rows.length) {
+        try {
+          adminBotSchedules = JSON.parse(rows[0].Value || rows[0].value || "[]");
+        } catch (e) { adminBotSchedules = []; }
+      } else {
+        adminBotSchedules = [];
+      }
+    }
+  } catch (e) {
+    adminBotSchedulesError = e.message;
+  }
+  if (!Array.isArray(adminBotSchedules) || !adminBotSchedules.length) {
+    adminBotSchedules = [{ id: "default", label: "Day-before reminder", hoursBeforeTest: 9, templateKey: "reminder", active: true }];
+  }
+  adminBotSchedulesLoaded = true;
+  render();
+}
+
+function renderBotSchedules() {
+  if (!adminBotSchedulesLoaded) {
+    return '<div style="font-size:12px;color:var(--muted);padding:20px 0;text-align:center">Loading…</div>';
+  }
+  if (adminBotSchedulesError) {
+    return '<div class="err-banner">' + esc(adminBotSchedulesError) + '</div>';
+  }
+  var rows = adminBotSchedules.map(function (s, i) {
+    return (
+      '<div class="session-row" style="flex-direction:column;align-items:stretch;margin-bottom:8px">' +
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+      '<input class="session-input" type="text" placeholder="Label" value="' + esc(s.label || "") + '" oninput="adminBotUpdateSched(' + i + ",'label',this.value)\" style=\"flex:1;min-width:140px\" />" +
+      '<input class="session-input" type="number" min="0" max="168" value="' + (s.hoursBeforeTest || 0) + '" oninput="adminBotUpdateSched(' + i + ",'hoursBeforeTest',+this.value)\" style=\"width:64px\" />" +
+      '<span style="font-size:11px;color:var(--muted)">h before test</span>' +
+      '<label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)"><input type="checkbox" ' + (s.active ? "checked" : "") + ' onchange="adminBotUpdateSched(' + i + ",'active',this.checked)\" /> active</label>" +
+      '<button class="session-del" onclick="adminBotDeleteSched(' + i + ')" ' + (adminBotSchedules.length > 1 ? "" : "disabled") + '>&#215;</button>' +
+      '</div></div>'
+    );
+  }).join("");
+
+  return (
+    '<div style="font-size:12px;color:var(--muted);margin-bottom:12px">' +
+    'Define when the daily reminder fires. The cron runs hourly and triggers each active entry once when (test date − hours) lands in the current hour.' +
+    '</div>' +
+    rows +
+    '<button class="add-session-btn" onclick="adminBotAddSched()">+ Add schedule</button>' +
+    '<div id="bot-schedules-status" class="admin-status"></div>' +
+    '<button class="btn-primary" style="margin-top:12px" onclick="adminBotSaveSchedules()">Save schedules</button>' +
+    '<button class="btn-secondary" onclick="adminBotSchedules=null;adminBotSchedulesLoaded=false;adminBotLoadSchedules()">Discard changes</button>'
+  );
+}
+function adminBotUpdateSched(i, field, value) {
+  if (!adminBotSchedules || !adminBotSchedules[i]) return;
+  adminBotSchedules[i][field] = value;
+  if (field === "active") render();
+}
+function adminBotAddSched() {
+  if (!adminBotSchedules) adminBotSchedules = [];
+  adminBotSchedules.push({
+    id: "s" + Date.now().toString(36),
+    label: "New reminder",
+    hoursBeforeTest: 1,
+    templateKey: "reminder",
+    active: true,
+  });
+  render();
+}
+function adminBotDeleteSched(i) {
+  if (!adminBotSchedules || adminBotSchedules.length <= 1) return;
+  adminBotSchedules.splice(i, 1);
+  render();
+}
+async function adminBotSaveSchedules() {
+  var statusEl = document.getElementById("bot-schedules-status");
+  if (statusEl) { statusEl.textContent = "Saving…"; statusEl.className = "admin-status"; }
+  try {
+    var res = await fetch(API + "/Key/bot_schedules?sheet=Settings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH },
+      body: JSON.stringify({ data: { Value: JSON.stringify(adminBotSchedules) } }),
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    if (statusEl) { statusEl.textContent = "✓ Saved"; statusEl.className = "admin-status ok"; }
+    showToast("Schedules saved", "success");
+  } catch (e) {
+    if (statusEl) { statusEl.textContent = "Save failed: " + e.message; statusEl.className = "admin-status err"; }
+  }
+}
+
+// ---- STATS ----
+async function adminBotLoadStats() {
+  adminBotStatsLoading = true;
+  adminBotStatsError = "";
+  render();
+  try {
+    var res = await fetch(API + "/admin/bot-stats", { headers: { "X-Admin-Hash": ADMIN_HASH } });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    adminBotStats = await res.json();
+  } catch (e) {
+    adminBotStatsError = e.message;
+  }
+  adminBotStatsLoading = false;
+  // Refresh every 30 seconds while user stays on the Stats tab.
+  if (adminBotStatsTimer) clearInterval(adminBotStatsTimer);
+  if (adminBotSubtab === "stats" && adminActiveTab === "bot") {
+    adminBotStatsTimer = setInterval(function () {
+      if (adminBotSubtab === "stats" && adminActiveTab === "bot") {
+        adminBotLoadStats();
+      } else {
+        clearInterval(adminBotStatsTimer);
+        adminBotStatsTimer = null;
+      }
+    }, 30000);
+  }
+  render();
+}
+
+function renderBotStats() {
+  if (adminBotStatsLoading && !adminBotStats) {
+    return '<div style="font-size:12px;color:var(--muted);padding:20px 0;text-align:center">Loading…</div>';
+  }
+  if (adminBotStatsError) {
+    return '<div class="err-banner">' + esc(adminBotStatsError) + '</div>';
+  }
+  var s = adminBotStats || {};
+  function row(label, val, color) {
+    return '<div style="display:flex;justify-content:space-between;font-size:13px;padding:6px 0;border-bottom:1px dashed var(--border)">' +
+      '<span style="color:var(--muted)">' + esc(label) + '</span>' +
+      '<span style="font-weight:600;' + (color ? "color:" + color : "") + '">' + esc(val) + '</span></div>';
+  }
+  var lb = s.lastBroadcast;
+  var lbText = lb
+    ? lb.sent + ' sent / ' + lb.recipients + ' (' + lb.status + ') · ' + String(lb.createdAt).slice(0, 16).replace('T', ' ')
+    : 'None yet';
+  var ns = s.nextScheduledSend;
+  var nsText = ns
+    ? ns.label + ' — ' + String(ns.fireAt).slice(0, 16).replace('T', ' ') + ' UTC'
+    : 'No active schedules / no test date';
+  return (
+    '<div style="font-size:12px;color:var(--muted);margin-bottom:12px">Live stats — refreshes every 30s.</div>' +
+    row('Total registrations', s.totalRegistrations || 0) +
+    row('Linked to Telegram', s.linkedCount || 0, '#3dbd8b') +
+    row('Not linked', s.unlinkedCount || 0, (s.unlinkedCount > 0 ? '#BA7517' : '')) +
+    row('Last broadcast', lbText) +
+    row('Next scheduled send', nsText) +
+    row('Last reminder fired', s.reminderSent || 'Never') +
+    (s.lastCronError
+      ? '<div style="margin-top:10px;padding:8px 10px;background:#FCEBEB;border:1px solid #F09595;border-radius:6px;font-size:11px;color:#791F1F">⚠ Last cron error: ' + esc(s.lastCronError) + '</div>'
+      : '') +
+    '<button class="btn-secondary" style="margin-top:14px;padding:6px 14px;font-size:12px" onclick="adminBotLoadStats()">Refresh now</button>'
+  );
 }
 
 initTheme();
