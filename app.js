@@ -14,6 +14,7 @@ var SLOTS = [
     bufferMinutes: 10,
     speakingDuration: 15,
     teachers: 2,
+    speakingEnabled: true,
   },
   {
     id: "main_1040",
@@ -24,6 +25,7 @@ var SLOTS = [
     bufferMinutes: 10,
     speakingDuration: 15,
     teachers: 2,
+    speakingEnabled: true,
   },
 ];
 var MAX = 10;
@@ -189,11 +191,21 @@ function buildSpeakingGrid(sessions, dc) {
   sessions = sessions || SLOTS;
   dc = dc || dayConfig;
   if (!sessions.length) return [];
-  // Effective speaking duration: assume consistent across sessions (UI enforces).
-  var dur = Number(sessions[0].speakingDuration) || SPEAK_DURATION_DEFAULT;
-  var teachers = Math.max(0, Number(sessions[0].teachers) || 0);
+  // Only sessions with speakingEnabled=true contribute to the grid (capacity +
+  // blocking). A session with speakingEnabled=false runs L+R only — its
+  // students never see the grid, so it shouldn't consume teachers and its
+  // main-exam time shouldn't block other speakers either.
+  var msSessions = sessions.filter(function (s) {
+    if (s.speakingEnabled === false) return false;
+    return Number(s.teachers) > 0;
+  });
+  if (!msSessions.length) return [];
+  // Effective speaking duration & teachers: take from the first MS session.
+  // The admin UI enforces consistency across MS sessions.
+  var dur = Number(msSessions[0].speakingDuration) || SPEAK_DURATION_DEFAULT;
+  var teachers = Math.max(0, Number(msSessions[0].teachers) || 0);
 
-  var sorted = sessions.slice().sort(function (a, b) {
+  var sorted = msSessions.slice().sort(function (a, b) {
     return toMin(a.label) - toMin(b.label);
   });
   var earliestStart = toMin(sorted[0].label);
@@ -217,7 +229,7 @@ function buildSpeakingGrid(sessions, dc) {
       capacity: teachers,
       blockedByMain: [],
     };
-    sessions.forEach(function (sess) {
+    msSessions.forEach(function (sess) {
       var mDur = Number(sess.mainDuration) || MAIN_DURATION_DEFAULT;
       var buf = Number(sess.bufferMinutes) || 0;
       var mStart = toMin(sess.label) - buf;
@@ -267,12 +279,15 @@ function poolId(slotId, et) {
   if (et === "speaking") return slotId + SPEAKING_SUFFIX;
   return slotId;
 }
+// A session is "MS" (Main + Speaking) iff its per-session toggle is on AND it
+// has at least one teacher to interview. The global registration_mode setting
+// has been retired in favor of this per-session flag.
 function isMSSession(slotId) {
-  if (registrationMode !== "main_speaking") return false;
   var s = SLOTS.find(function (sl) {
     return sl.id === slotId;
   });
   if (!s) return false;
+  if (s.speakingEnabled === false) return false;
   return Number(s.teachers) > 0;
 }
 
@@ -749,14 +764,13 @@ function getDoorsOpenTime(label) {
 }
 
 function renderProgressBar(activeStep) {
-  // Show 3 steps whenever any session has speaking enabled in main_speaking mode,
-  // so the user sees the full path before picking a session.
-  var anyMS = registrationMode === "main_speaking" && SLOTS.some(function (s) {
-    return Number(s.teachers) > 0;
+  // Show 3 steps whenever at least one session has speaking enabled. Before
+  // the student picks a session we don't know which they'll choose, so we
+  // optimistically show 3 steps if any speaking session exists.
+  var anyMS = SLOTS.some(function (s) {
+    return s.speakingEnabled !== false && Number(s.teachers) > 0;
   });
-  var hasSpeakStep = form.slot
-    ? registrationMode === "main_speaking" && isMSSession(form.slot)
-    : anyMS;
+  var hasSpeakStep = form.slot ? isMSSession(form.slot) : anyMS;
   var labels = "";
   var widthPct = 0;
 
@@ -1079,7 +1093,7 @@ function renderStep2() {
   // Schedule recap for Main+Speaking mode — shows the picked main + speaking times.
   var schedPill = "";
   var schedBoxHtml = "";
-  if (registrationMode === "main_speaking" && isMSSession(form.slot) && form.speak) {
+  if (isMSSession(form.slot) && form.speak) {
     var mainStart = toMin(slotInfo.label);
     var mDur = Number(slotInfo.mainDuration) || MAIN_DURATION_DEFAULT;
     var spkStart = toMin(form.speak);
@@ -1717,7 +1731,7 @@ async function submitForm() {
     render();
     return;
   }
-  var isMS = registrationMode === "main_speaking" && isMSSession(form.slot);
+  var isMS = isMSSession(form.slot);
   if (isMS && !form.speak) {
     step = 6;
     render();
@@ -1852,13 +1866,23 @@ async function performCancellationLogic(reg) {
 
   if (cleanPhone.length > 3) {
     try {
-      await fetch(
-        API + "/Phone/" + phonePathSeg(cancelPhone) + "?sheet=Registrations",
+      // ?confirm=1 makes the worker AWAIT the Google Sheets sync and report
+      // whether it succeeded — so the admin sees a real "synced to Sheets"
+      // confirmation (or a red banner with the underlying error) instead of
+      // a silent drift.
+      var delRes = await fetch(
+        API + "/Phone/" + phonePathSeg(cancelPhone) + "?sheet=Registrations&confirm=1",
         {
           method: "DELETE",
           headers: { "Content-Type": "application/json" },
         },
       );
+      try {
+        var delBody = await delRes.json();
+        if (delBody && delBody.sheetsSync === "failed") {
+          showToast("Sheets sync failed: " + (delBody.sheetsError || "see Cloudflare logs"), "error");
+        }
+      } catch (e) { /* response wasn't JSON — already handled */ }
     } catch (e) {
       /* deletion failure is non-fatal — seat is already restored */
     }
@@ -1960,7 +1984,7 @@ async function confirmChangeSlot() {
       );
     } catch (e) {}
     submitting = false;
-    var goSpeak = registrationMode === "main_speaking" && isMSSession(reg.slotId);
+    var goSpeak = isMSSession(reg.slotId);
     newSlotChoice = null;
     if (goSpeak) {
       form.slot = reg.slotId;
@@ -2050,6 +2074,19 @@ async function loadDeadline() {
 function migrateLegacySession(s) {
   var legacyId = String(s.id || "");
   var newId = normalizeSlotId(legacyId);
+  // speakingEnabled rules:
+  //   - present on incoming row → honor it
+  //   - legacy row with teachers > 0 → treat as enabled
+  //   - else → disabled
+  var teachers =
+    s.teachers !== undefined
+      ? Number(s.teachers)
+      : s.speakingEnabled
+        ? 1
+        : 0;
+  var speakingEnabled;
+  if (s.speakingEnabled !== undefined) speakingEnabled = !!s.speakingEnabled;
+  else speakingEnabled = teachers > 0;
   return {
     id: newId,
     label: s.label,
@@ -2061,12 +2098,8 @@ function migrateLegacySession(s) {
         ? Number(s.bufferMinutes)
         : SPEAKING_GAP_DEFAULT,
     speakingDuration: Number(s.speakingDuration) || SPEAK_DURATION_DEFAULT,
-    teachers:
-      s.teachers !== undefined
-        ? Number(s.teachers)
-        : s.speakingEnabled
-          ? 1
-          : 0,
+    teachers: teachers,
+    speakingEnabled: speakingEnabled,
   };
 }
 
@@ -2608,9 +2641,6 @@ function renderAdminPanelHTML() {
     (adminActiveTab === "sessions" ? " active" : "") +
     '" onclick="adminSwitchTab(\'sessions\')">Sessions</button>' +
     '<button class="admin-tab' +
-    (adminActiveTab === "mode" ? " active" : "") +
-    '" onclick="adminSwitchTab(\'mode\')">Mode</button>' +
-    '<button class="admin-tab' +
     (adminActiveTab === "students" ? " active" : "") +
     '" onclick="adminSwitchTab(\'students\')">Students' + studentsBadge + '</button>' +
     '<button class="admin-tab' +
@@ -2755,34 +2785,8 @@ function renderAdminPanelHTML() {
     );
   }
 
-  // Mode tab
-  if (adminActiveTab === "mode") {
-    var isMS = registrationMode === "main_speaking";
-    return (
-      '<div class="admin-panel"><div class="admin-title">Settings</div>' +
-      tabs +
-      '<div style="font-size:13px;color:var(--muted);margin-bottom:14px">Choose the exam format students see when registering.</div>' +
-      '<div class="mode-card' +
-      (!isMS ? " mode-on" : "") +
-      '" onclick="adminSetMode(\'lr_only\')">' +
-      '<div class="mode-card-title">L+R Only ' +
-      (!isMS ? '<span class="mode-badge">ACTIVE</span>' : "") +
-      "</div>" +
-      '<div class="mode-card-desc">Students pick a session time only. No exam type selection. For listening + reading tests without speaking.</div>' +
-      "</div>" +
-      '<div class="mode-card' +
-      (isMS ? " mode-on" : "") +
-      '" onclick="adminSetMode(\'main_speaking\')">' +
-      '<div class="mode-card-title">Main + Speaking ' +
-      (isMS ? '<span class="mode-badge">ACTIVE</span>' : "") +
-      "</div>" +
-      '<div class="mode-card-desc">Students choose Main-first or Speaking-first. Their estimated schedule is shown on the details page. Configure per session in the Sessions tab.</div>' +
-      "</div>" +
-      '<div id="admin-mode-status" class="admin-status"></div>' +
-      '<button class="btn-secondary" onclick="closeAdmin()">Close</button>' +
-      '<button class="btn-secondary" style="margin-top:4px;color:var(--red);border-color:var(--red-border)" onclick="adminLogout()">Log out</button></div>'
-    );
-  }
+  // (Mode tab was removed — per-session "Speaking enabled" toggle in
+  // Sessions tab replaces the global L+R-only / Main+Speaking switch.)
 
   // Sessions tab
   var draft =
@@ -2800,6 +2804,9 @@ function renderAdminPanelHTML() {
             : SPEAKING_GAP_DEFAULT,
         speakingDuration: Number(s.speakingDuration) || SPEAK_DURATION_DEFAULT,
         teachers: s.teachers !== undefined ? Number(s.teachers) : 0,
+        speakingEnabled: s.speakingEnabled !== undefined
+          ? !!s.speakingEnabled
+          : (Number(s.teachers) || 0) > 0,
       };
     });
   adminSessionDraft = draft;
@@ -2846,14 +2853,21 @@ function renderAdminPanelHTML() {
         '<input class="session-input" type="number" min="0" max="120" value="' + s.bufferMinutes + '" oninput="adminUpdateSession(' + i + ",'bufferMinutes',this.value)\" style=\"width:60px\" />" +
         '<span style="font-size:11px;color:var(--muted)">min</span>' +
         '</div>' +
-        (registrationMode === "main_speaking"
-          ? '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-top:8px;margin-top:8px;border-top:1px dashed var(--border)">' +
-            '<span style="font-size:11px;color:var(--speak);font-weight:600">&#127908; Speaking</span>' +
-            '<span style="font-size:11px;color:var(--muted)">slot length</span>' +
+        // Per-session "Speaking enabled" toggle. When off this session runs
+        // L+R only — students skip the speaking grid step.
+        '<div style="display:flex;align-items:center;gap:8px;padding-top:8px;margin-top:8px;border-top:1px dashed var(--border)">' +
+        '<label style="display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:var(--speak);cursor:pointer">' +
+        '<input type="checkbox" ' + (s.speakingEnabled !== false ? "checked" : "") + ' onchange="adminToggleSessionSpeaking(' + i + ')" /> &#127908; Speaking enabled' +
+        '</label>' +
+        '<span style="font-size:11px;color:var(--muted)">(off = L+R only for this session)</span>' +
+        '</div>' +
+        (s.speakingEnabled !== false
+          ? '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-top:8px;margin-top:8px">' +
+            '<span style="font-size:11px;color:var(--muted)">Slot length</span>' +
             '<input class="session-input" type="number" min="5" max="60" value="' + s.speakingDuration + '" oninput="adminUpdateSession(' + i + ",'speakingDuration',this.value)\" style=\"width:60px\" />" +
             '<span style="font-size:11px;color:var(--muted)">min · teachers</span>' +
             '<input class="session-input teach-input" type="number" min="0" max="20" value="' + s.teachers + '" oninput="adminUpdateSession(' + i + ",'teachers',this.value)\" />" +
-            '<span style="font-size:11px;color:var(--muted)">(0 disables speaking)</span>' +
+            '<span style="font-size:11px;color:var(--muted)">in parallel</span>' +
             '</div>'
           : "");
       return (
@@ -2898,7 +2912,14 @@ function renderAdminFeasibility(draft, dc) {
           : SPEAKING_GAP_DEFAULT,
       speakingDuration: Number(s.speakingDuration) || SPEAK_DURATION_DEFAULT,
       teachers: Number(s.teachers) || 0,
+      speakingEnabled: s.speakingEnabled !== false,
     };
+  });
+  // Only sessions with speakingEnabled contribute to the speaking grid and the
+  // feasibility check. L+R-only sessions are reported for completeness but
+  // don't draw against speaking capacity.
+  var msSessions = sessions.filter(function (s) {
+    return s.speakingEnabled && s.teachers > 0;
   });
   // Day config: honor the override; otherwise derive from sessions.
   var dcEff = { dayStart: dc.dayStart, dayClose: dc.dayClose, dayCloseOverride: dc.dayCloseOverride };
@@ -2915,32 +2936,44 @@ function renderAdminFeasibility(draft, dc) {
     if (!dcEff.dayStart) dcEff.dayStart = toHHMM(toMin(sorted[0].label));
   }
 
-  // Validation: teachers and speakingDuration consistency.
+  // Validation: teachers and speakingDuration consistency ACROSS MS sessions.
+  // L+R-only sessions are deliberately excluded — they have teachers=0 by design.
   var warnings = [];
-  if (sessions.length) {
-    var t0 = sessions[0].teachers;
-    var d0 = sessions[0].speakingDuration;
-    var teachersAgree = sessions.every(function (s) { return s.teachers === t0; });
-    var durAgree = sessions.every(function (s) { return s.speakingDuration === d0; });
-    if (!teachersAgree) warnings.push("Teachers count differs between sessions — speaking grid uses the first session's value.");
-    if (!durAgree) warnings.push("Speaking duration differs between sessions — grid uses the first session's value.");
+  if (msSessions.length > 1) {
+    var t0 = msSessions[0].teachers;
+    var d0 = msSessions[0].speakingDuration;
+    var teachersAgree = msSessions.every(function (s) { return s.teachers === t0; });
+    var durAgree = msSessions.every(function (s) { return s.speakingDuration === d0; });
+    if (!teachersAgree) warnings.push("Teachers count differs between speaking sessions — grid uses the first MS session's value.");
+    if (!durAgree) warnings.push("Speaking duration differs between sessions — grid uses the first MS session's value.");
   }
 
   var grid = buildSpeakingGrid(sessions, dcEff);
-  // Per-session reachable seats:
+  // Per-session reachable seats — only computed for sessions with speaking.
+  var teachersPerSlot = msSessions.length ? msSessions[0].teachers : 0;
   var perSession = sessions.map(function (s) {
+    if (!s.speakingEnabled || s.teachers <= 0) {
+      return { session: s, validSlots: 0, reachable: 0, ok: true, lrOnly: true };
+    }
     var validCount = grid.filter(function (g) {
       return g.capacity > 0 && g.blockedByMain.indexOf(s.id) === -1;
     }).length;
-    var reachable = validCount * (Number(sessions[0].teachers) || 0);
+    var reachable = validCount * teachersPerSlot;
     var ok = reachable >= s.mainSeats;
-    return { session: s, validSlots: validCount, reachable: reachable, ok: ok };
+    return { session: s, validSlots: validCount, reachable: reachable, ok: ok, lrOnly: false };
   });
 
   var totalMain = sessions.reduce(function (a, s) { return a + s.mainSeats; }, 0);
-  var totalSpeak = grid.filter(function (g) { return g.capacity > 0; }).length * (sessions[0] ? sessions[0].teachers || 0 : 0);
+  var totalSpeak = grid.filter(function (g) { return g.capacity > 0; }).length * teachersPerSlot;
 
   var rowsHtml = perSession.map(function (p) {
+    if (p.lrOnly) {
+      return (
+        '<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;color:var(--muted)">' +
+        '<span>' + esc(p.session.label) + '</span>' +
+        '<span style="font-style:italic">L+R only &middot; ' + p.session.mainSeats + ' main seats</span></div>'
+      );
+    }
     var color = p.ok ? "#3dbd8b" : "#e05a5a";
     return (
       '<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0">' +
@@ -2960,7 +2993,7 @@ function renderAdminFeasibility(draft, dc) {
   var headerColor = anyBad ? "#e05a5a" : "#3dbd8b";
 
   return (
-    '<div style="margin-top:12px;padding:10px 12px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px">' +
+    '<div id="admin-capacity-preview" style="margin-top:12px;padding:10px 12px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px">' +
     '<div style="font-size:12px;font-weight:600;color:' + headerColor + ';margin-bottom:6px">Capacity preview &mdash; ' +
     totalMain + ' main seats, ' + totalSpeak + ' speaking seats (' + grid.length + ' grid cells)</div>' +
     rowsHtml +
@@ -3029,6 +3062,25 @@ var ADMIN_NUMERIC_FIELDS = {
   speakingDuration: 1,
   teachers: 1,
 };
+
+// Debounced in-place refresh of the capacity preview. We do NOT call render()
+// on every keystroke because that destroys/recreates the input element and
+// drops focus mid-typing. Instead, only the preview block (id'd above)
+// re-renders, which is enough to give the admin live feedback.
+var _capacityPreviewTimer = null;
+function refreshCapacityPreview() {
+  if (_capacityPreviewTimer) clearTimeout(_capacityPreviewTimer);
+  _capacityPreviewTimer = setTimeout(function () {
+    _capacityPreviewTimer = null;
+    if (!adminSessionDraft || !adminDayDraft) return;
+    var el = document.getElementById("admin-capacity-preview");
+    if (!el) return;
+    try {
+      el.outerHTML = renderAdminFeasibility(adminSessionDraft, adminDayDraft);
+    } catch (e) { /* malformed draft mid-typing — ignore */ }
+  }, 150);
+}
+
 function adminUpdateSession(index, field, value) {
   if (!adminSessionDraft) return;
   if (ADMIN_NUMERIC_FIELDS[field]) {
@@ -3037,18 +3089,28 @@ function adminUpdateSession(index, field, value) {
     } else {
       adminSessionDraft[index][field] = Number(value);
     }
-    // Re-render so the capacity preview updates live.
-    render();
+    refreshCapacityPreview();
   } else {
     adminSessionDraft[index][field] = value;
-    // Re-render label/period changes too — they affect the grid.
-    if (field === "label") render();
+    if (field === "label" || field === "period") refreshCapacityPreview();
   }
 }
 
 function adminUpdateDay(field, value) {
   if (!adminDayDraft) return;
   adminDayDraft[field] = value;
+  refreshCapacityPreview();
+}
+
+// Toggle Speaking enabled/disabled for a single session. This DOES re-render
+// since the visible fields below it (teachers / speakingDuration) appear and
+// disappear with the toggle — no in-place refresh is possible.
+function adminToggleSessionSpeaking(index) {
+  if (!adminSessionDraft || !adminSessionDraft[index]) return;
+  var s = adminSessionDraft[index];
+  s.speakingEnabled = !(s.speakingEnabled !== false); // current OR-defaulted-true → flip
+  if (s.speakingEnabled && (!s.teachers || s.teachers < 1)) s.teachers = 1;
+  if (!s.speakingEnabled) s.teachers = 0;
   render();
 }
 function adminToggleDerivedClose() {
@@ -3103,6 +3165,9 @@ function adminAddSession() {
         bufferMinutes: s.bufferMinutes !== undefined ? Number(s.bufferMinutes) : SPEAKING_GAP_DEFAULT,
         speakingDuration: Number(s.speakingDuration) || SPEAK_DURATION_DEFAULT,
         teachers: s.teachers !== undefined ? Number(s.teachers) : 0,
+        speakingEnabled: s.speakingEnabled !== undefined
+          ? !!s.speakingEnabled
+          : (Number(s.teachers) || 0) > 0,
       };
     });
   }
@@ -3114,6 +3179,7 @@ function adminAddSession() {
     label: "00:00",
     mainSeats: 10,
     period: "",
+    speakingEnabled: template.speakingEnabled !== false,
     mainDuration: Number(template.mainDuration) || MAIN_DURATION_DEFAULT,
     bufferMinutes: template.bufferMinutes !== undefined ? Number(template.bufferMinutes) : SPEAKING_GAP_DEFAULT,
     speakingDuration: Number(template.speakingDuration) || SPEAK_DURATION_DEFAULT,
@@ -3172,6 +3238,9 @@ async function adminSaveSessions() {
       var existingSlot = SLOTS.find(function (sl) {
         return sl.id === s.id;
       });
+      var speakingEnabled = s.speakingEnabled !== undefined
+        ? !!s.speakingEnabled
+        : (Number(s.teachers) || 0) > 0;
       return {
         id: s.id,
         label: s.label,
@@ -3180,7 +3249,8 @@ async function adminSaveSessions() {
         mainDuration: Number(s.mainDuration) || MAIN_DURATION_DEFAULT,
         bufferMinutes: s.bufferMinutes !== undefined ? Number(s.bufferMinutes) : SPEAKING_GAP_DEFAULT,
         speakingDuration: Number(s.speakingDuration) || SPEAK_DURATION_DEFAULT,
-        teachers: Number(s.teachers) || 0,
+        teachers: speakingEnabled ? (Number(s.teachers) || 1) : 0,
+        speakingEnabled: speakingEnabled,
       };
     });
     await saveSessionConfig(configToSave);
@@ -3206,6 +3276,7 @@ async function adminSaveSessions() {
         bufferMinutes: s.bufferMinutes,
         speakingDuration: s.speakingDuration,
         teachers: s.teachers,
+        speakingEnabled: !!s.speakingEnabled,
       };
     });
     VALID_SLOT_IDS = SLOTS.map(function (s) {

@@ -217,6 +217,12 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
 
   // Build the GAS tunnel payload for background sync
   const targetUrl = env.GAS_URL || APP_SCRIPT_URL;
+  // Cold-start log so an admin tail can confirm which GAS endpoint is being
+  // hit. Throttled to once per worker isolate to avoid log spam.
+  if (!globalThis.__gasUrlLogged) {
+    globalThis.__gasUrlLogged = true;
+    console.log("Worker bound to GAS_URL", { sourcedFromEnv: !!env.GAS_URL, targetUrl });
+  }
   const tunnelPayload = {
     method: method,
     sheet: sheet,
@@ -225,34 +231,69 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
     body: parsedBody,
   };
 
-  // Helper: fire-and-forget sync to Google Sheets with exponential backoff retry
-  function bgSync() {
-    if (ctx && targetUrl && !targetUrl.includes("PASTE_YOUR_WEB")) {
-      ctx.waitUntil(
-        (async function() {
-          const retries = 3;
-          for (let attempt = 0; attempt <= retries; attempt++) {
-            try {
-              const resp = await fetch(targetUrl, {
-                method: "POST",
-                body: JSON.stringify(tunnelPayload),
-                headers: { "Content-Type": "text/plain" },
-              });
-              if (resp.ok) return; // successful sync!
-              if (attempt < retries) {
-                await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
-              }
-            } catch (e) {
-              if (attempt === retries) {
-                console.error("bgSync permanently failed after retries:", e);
-                break;
-              }
-              await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
-            }
-          }
-        })()
-      );
+  // Run one sync attempt against the GAS endpoint and resolve to a status.
+  // Always logs the outcome (success or failure) so Cloudflare tail surfaces
+  // it. Used both by bgSync (fire-and-forget) and runSyncConfirmed
+  // (awaited from admin actions that need to confirm the Sheets write).
+  async function runOneSync() {
+    if (!targetUrl || targetUrl.includes("PASTE_YOUR_WEB")) {
+      return { ok: false, error: "GAS_URL not configured" };
     }
+    const meta = { method, sheet, path: subPath };
+    try {
+      const resp = await fetch(targetUrl, {
+        method: "POST",
+        body: JSON.stringify(tunnelPayload),
+        headers: { "Content-Type": "text/plain" },
+      });
+      if (resp.ok) {
+        let body = null;
+        try { body = await resp.clone().json(); } catch (e) {}
+        return { ok: true, status: resp.status, body };
+      }
+      let bodyText = "";
+      try { bodyText = await resp.text(); } catch (e) {}
+      console.error("bgSync non-2xx", { status: resp.status, body: bodyText.slice(0, 400), ...meta });
+      return { ok: false, status: resp.status, error: bodyText.slice(0, 400) || ("HTTP " + resp.status) };
+    } catch (e) {
+      console.error("bgSync threw", { error: String(e && e.message || e), ...meta });
+      return { ok: false, error: String(e && e.message || e) };
+    }
+  }
+
+  // Fire-and-forget sync to Google Sheets with exponential backoff retry.
+  function bgSync() {
+    if (!ctx) return;
+    ctx.waitUntil(
+      (async function () {
+        const retries = 3;
+        for (let attempt = 0; attempt <= retries; attempt++) {
+          const result = await runOneSync();
+          if (result.ok) return;
+          if (attempt < retries) {
+            await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt)));
+          } else {
+            console.error("bgSync permanently failed after retries", { attempts: retries + 1, lastError: result.error });
+          }
+        }
+      })()
+    );
+  }
+
+  // Awaited sync — used when the client explicitly requests confirmation
+  // (e.g. admin cancellation via ?confirm=1). Tries up to 3 attempts.
+  async function runSyncConfirmed() {
+    const retries = 2;
+    let last = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      const r = await runOneSync();
+      if (r.ok) return r;
+      last = r;
+      if (attempt < retries) {
+        await new Promise((res) => setTimeout(res, 500 * (attempt + 1)));
+      }
+    }
+    return last || { ok: false, error: "Sync attempt produced no result" };
   }
 
   // ==========================================================
@@ -374,7 +415,7 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
       if (parts.length === 2) {
         const phoneToDel = decodeURIComponent(parts[1]);
         const cleanPhoneToDel = phoneToDel.replace(/\D/g, "").slice(-9);
-        
+
         // --- NEW: Send Cancellation Notification ---
         if (token) {
           try {
@@ -396,7 +437,21 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
           return rp !== cleanPhoneToDel;
         });
         await db.put("Registrations", JSON.stringify(rows));
-        bgSync(); // background sync to Google Sheets
+
+        // When the client requests confirmation (admin cancellation), AWAIT
+        // the GAS sync and return its status. Otherwise keep fire-and-forget.
+        if (qsParams.confirm === "1") {
+          const sync = await runSyncConfirmed();
+          return new Response(
+            JSON.stringify({
+              deleted: 1,
+              sheetsSync: sync.ok ? "ok" : "failed",
+              sheetsError: sync.ok ? undefined : sync.error,
+            }),
+            { status: 200, headers: corsHeaders }
+          );
+        }
+        bgSync();
       }
       return new Response(JSON.stringify({ deleted: 1 }), {
         status: 200,
@@ -1722,57 +1777,15 @@ async function validateScheduling(db, registrations, payload) {
 
 function correctRegistration(reg) {
   if (!reg) return reg;
-
-  var session = reg.Session || reg.session;
-  var examType = reg.ExamType || reg.examtype;
-  var speakTime = reg.SpeakingTime || reg.speakingtime;
-  var mainTime = reg.MainTime || reg.maintime;
-
-  if (!session || !examType) return reg;
-
-  var sessionMin = parseTimeToMin(session);
-  if (isNaN(sessionMin)) return reg;
-
-  var et = String(examType).trim().toLowerCase();
-  
-  if (et === "main" || et === "main first") {
-    if (speakTime) {
-      var speakMin = parseTimeToMin(speakTime);
-      if (!isNaN(speakMin)) {
-        var diff = speakMin - sessionMin - 150;
-        if (diff >= 0 && diff % 15 === 0) {
-          var newSpeakMin = speakMin + 10;
-          var newSpeakStr = formatMinutesToHHMM(newSpeakMin);
-          if (String(speakTime).endsWith(" (est.)")) {
-            newSpeakStr += " (est.)";
-          }
-          if (reg.SpeakingTime !== undefined) reg.SpeakingTime = newSpeakStr;
-          if (reg.speakingtime !== undefined) reg.speakingtime = newSpeakStr;
-          if (reg.SpeakingTime === undefined && reg.speakingtime === undefined) {
-            reg.SpeakingTime = newSpeakStr;
-          }
-        }
-      }
-    }
-  } else if (et === "speaking" || et === "speaking first") {
-    if (mainTime) {
-      var mainMin = parseTimeToMin(mainTime);
-      if (!isNaN(mainMin)) {
-        if (mainMin === sessionMin + 150) {
-          var newMainMin = mainMin + 10;
-          var newMainStr = formatMinutesToHHMM(newMainMin);
-          if (String(mainTime).endsWith(" (est.)")) {
-            newMainStr += " (est.)";
-          }
-          if (reg.MainTime !== undefined) reg.MainTime = newMainStr;
-          if (reg.maintime !== undefined) reg.maintime = newMainStr;
-          if (reg.MainTime === undefined && reg.maintime === undefined) {
-            reg.MainTime = newMainStr;
-          }
-        }
-      }
-    }
-  }
+  // The previous body shifted Speaking/Main times by +10 minutes when they
+  // matched the old queue-derived pattern (session + 150 + n*15). That logic
+  // pre-dates the explicit-slot grid and now actively CORRUPTS new-model
+  // registrations on every POST and every read: a student picking speak=10:45
+  // for main 08:00 gets silently rewritten to 10:55 in Sheets, etc.
+  //
+  // Times now come from the client as the student's chosen explicit values
+  // and must not be modified server-side. Keep this as an identity function
+  // so the 9 call sites in this file don't need to change.
   return reg;
 }
 
