@@ -167,6 +167,13 @@ function normalizeSlotId(id) {
   return id;
 }
 // Day-level defaults derived from SLOTS when admin hasn't pinned an override.
+//
+// Derived dayClose must extend past last main end far enough to actually fit
+// every student through speaking — otherwise a single-session day produces an
+// empty grid (every cell falls inside the session's own main window). The
+// extension is computed per MS session as:
+//   needed = ceil(mainSeats / teachers) * speakingDuration + bufferMinutes
+// then dayClose = max(session_end + needed) across MS sessions.
 function normalizeDayConfig() {
   if (!Array.isArray(SLOTS) || !SLOTS.length) return;
   var sessions = SLOTS.slice().sort(function (a, b) {
@@ -178,6 +185,19 @@ function normalizeDayConfig() {
     var dur = Number(s.mainDuration) || MAIN_DURATION_DEFAULT;
     var end = toMin(s.label) + dur;
     if (end > lastEnd) lastEnd = end;
+    // For MS sessions, also account for the time their students need AFTER
+    // main ends for their speaking interview. Extension = speaking time +
+    // buffer + one extra slot of slack to absorb 15-min grid alignment loss
+    // between (mainEnd + buffer) and the next aligned grid boundary.
+    if (s.speakingEnabled !== false && Number(s.teachers) > 0) {
+      var teachers = Math.max(1, Number(s.teachers));
+      var sdur = Number(s.speakingDuration) || SPEAK_DURATION_DEFAULT;
+      var buf = s.bufferMinutes !== undefined ? Number(s.bufferMinutes) : SPEAKING_GAP_DEFAULT;
+      var seats = Number(s.mainSeats) || 0;
+      var needed = Math.ceil(seats / teachers) * sdur + buf + sdur;
+      var sessionFire = toMin(s.label) + dur + needed;
+      if (sessionFire > lastEnd) lastEnd = sessionFire;
+    }
   });
   if (!dayConfig.dayStart) dayConfig.dayStart = toHHMM(earliestStart);
   if (!dayConfig.dayCloseOverride) {
@@ -2251,6 +2271,35 @@ async function syncSeatsSheet(sessions) {
     })
     .filter(Boolean);
 
+  // ── Step 1b: Pull the current Registrations roster ──────────────────
+  // We reconcile every pool against actual registrations rather than relying
+  // on delta math against the previous max. This is self-healing: any prior
+  // drift (e.g. seat decrements that never got restored on cancellation) is
+  // corrected on the next admin save.
+  var regs = [];
+  try {
+    var rRes = await fetch(API + "?sheet=Registrations");
+    if (rRes.ok) {
+      var rParsed = await rRes.json();
+      if (Array.isArray(rParsed)) regs = rParsed;
+    }
+  } catch (e) {
+    /* network error — treat as no registrations */
+  }
+  function stripEst(v) {
+    return String(v || "").replace(/ \(est\.\)$/, "").trim();
+  }
+  function countMainFor(sessionLabel) {
+    return regs.reduce(function (n, r) {
+      return stripEst(r.Session || r.session) === sessionLabel ? n + 1 : n;
+    }, 0);
+  }
+  function countSpeakFor(label) {
+    return regs.reduce(function (n, r) {
+      return stripEst(r.SpeakingTime || r.speakingtime) === label ? n + 1 : n;
+    }, 0);
+  }
+
   // ── Step 2: Build the updates list ────────────────────────────────────
   var updates = [];
 
@@ -2258,39 +2307,34 @@ async function syncSeatsSheet(sessions) {
   // speaking slot in the day grid (capacity = teachers).
   var desired = [];
   sessions.forEach(function (s) {
+    var max = Number(s.mainSeats) || Number(s.maxSeats) || 1;
+    var taken = countMainFor(s.label);
     desired.push({
       id: s.id,
-      maxSeats: Number(s.mainSeats) || Number(s.maxSeats) || 1,
+      maxSeats: max,
+      remaining: Math.max(0, max - taken),
       isSpeaking: false,
     });
   });
   var grid = buildSpeakingGrid(sessions, dayConfig);
   grid.forEach(function (g) {
     if (g.capacity <= 0) return; // teachers=0 → no speaking pools at all
+    var taken = countSpeakFor(g.label);
     desired.push({
       id: g.poolId,
       maxSeats: g.capacity,
+      remaining: Math.max(0, g.capacity - taken),
       isSpeaking: true,
     });
   });
 
   desired.forEach(function (d) {
     var existsInSheet = liveIds.indexOf(d.id) !== -1;
-    if (existsInSheet) {
-      // Row already in sheet — calculate adjusted remaining count
-      var current = seats[d.id] !== undefined ? seats[d.id] : d.maxSeats;
-      var oldMax = getMaxSeats(d.id);
-      var newRemaining;
-      if (d.maxSeats > oldMax) {
-        newRemaining = Math.max(0, current) + (d.maxSeats - oldMax);
-      } else {
-        newRemaining = Math.min(current, d.maxSeats);
-      }
-      updates.push({ id: d.id, remaining: newRemaining, op: "patch" });
-    } else {
-      // New slot — POST a fresh row with full seats available
-      updates.push({ id: d.id, remaining: d.maxSeats, op: "post" });
-    }
+    updates.push({
+      id: d.id,
+      remaining: d.remaining,
+      op: existsInSheet ? "patch" : "post",
+    });
   });
 
   // Any live row NOT in the desired set should be deleted
@@ -2351,12 +2395,17 @@ async function syncSeatsSheet(sessions) {
   }
 
   // ── Step 4: All calls succeeded — update memory ───────────────────────
+  // Map desired entries by id so we can copy their max into the in-memory
+  // cache alongside the new Remaining value.
+  var maxById = {};
+  desired.forEach(function (d) { maxById[d.id] = d.maxSeats; });
   updates.forEach(function (u) {
     if (u.op === "delete") {
       delete seats[u.id];
       delete seats["__max__" + u.id];
     } else {
       seats[u.id] = u.remaining;
+      if (maxById[u.id] !== undefined) seats["__max__" + u.id] = maxById[u.id];
     }
   });
 }
@@ -2921,7 +2970,9 @@ function renderAdminFeasibility(draft, dc) {
   var msSessions = sessions.filter(function (s) {
     return s.speakingEnabled && s.teachers > 0;
   });
-  // Day config: honor the override; otherwise derive from sessions.
+  // Day config: honor the override; otherwise derive from sessions using
+  // the same extension logic as normalizeDayConfig — so the admin preview
+  // matches the day window the student will actually see.
   var dcEff = { dayStart: dc.dayStart, dayClose: dc.dayClose, dayCloseOverride: dc.dayCloseOverride };
   if (!dcEff.dayCloseOverride && sessions.length) {
     var sorted = sessions.slice().sort(function (a, b) {
@@ -2929,8 +2980,17 @@ function renderAdminFeasibility(draft, dc) {
     });
     var lastEnd = 0;
     sorted.forEach(function (s) {
-      var e = toMin(s.label) + (Number(s.mainDuration) || MAIN_DURATION_DEFAULT);
+      var dur = Number(s.mainDuration) || MAIN_DURATION_DEFAULT;
+      var e = toMin(s.label) + dur;
       if (e > lastEnd) lastEnd = e;
+      if (s.speakingEnabled && s.teachers > 0) {
+        var sdur = Number(s.speakingDuration) || SPEAK_DURATION_DEFAULT;
+        var buf = s.bufferMinutes !== undefined ? Number(s.bufferMinutes) : SPEAKING_GAP_DEFAULT;
+        var seatsCount = Number(s.mainSeats) || 0;
+        var needed = Math.ceil(seatsCount / Math.max(1, s.teachers)) * sdur + buf + sdur;
+        var sessionFire = toMin(s.label) + dur + needed;
+        if (sessionFire > lastEnd) lastEnd = sessionFire;
+      }
     });
     dcEff.dayClose = toHHMM(lastEnd);
     if (!dcEff.dayStart) dcEff.dayStart = toHHMM(toMin(sorted[0].label));
