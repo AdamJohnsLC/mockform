@@ -395,7 +395,8 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
               botTexts.bot_text_registration_success_prefix,
               false,
               payload.CandidateNumber,
-              botTexts
+              botTexts,
+              buildRegularCtx(settings)
             );
             await sendTelegram(token, "sendMessage", { chat_id: cid, text: msg, parse_mode: "HTML", disable_web_page_preview: true });
           }
@@ -514,7 +515,8 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
                   botTexts.bot_text_registration_updated_prefix,
                   false,
                   fullReg.CandidateNumber || fullReg.candidatenumber,
-                  botTexts
+                  botTexts,
+                  buildRegularCtx(settings)
                 );
                 await sendTelegram(token, "sendMessage", { chat_id: cid, text: msg, parse_mode: "HTML", disable_web_page_preview: true });
               }
@@ -823,7 +825,8 @@ async function botDeepLink(db, token, chatId, phone) {
       msg,
       false,
       reg.CandidateNumber || reg.candidatenumber,
-      botTexts
+      botTexts,
+      buildRegularCtx(settings)
     );
   } else {
     msg += "We found <b>" + matchedRegs.length + "</b> registrations linked to this phone number:\n\n";
@@ -847,7 +850,8 @@ async function botDeepLink(db, token, chatId, phone) {
           "",
           false,
           reg.CandidateNumber || reg.candidatenumber,
-          botTexts
+          botTexts,
+          buildRegularCtx(settings)
         ) + "\n\n";
     }
   }
@@ -937,7 +941,8 @@ async function botStatus(db, token, chatId) {
         "",
         false,
         reg.CandidateNumber || reg.candidatenumber,
-        botTexts
+        botTexts,
+        buildRegularCtx(settings)
       ) + "\n\n";
   }
 
@@ -1121,9 +1126,10 @@ async function sendAllReminders(db, token) {
   var settings = await db.get("Settings", "json");
   if (!settings || typeof settings !== "object") settings = {};
 
-  var testDateStr = settings.test_date;
+  // Fall back to regular_arrival_at when test_date isn't set (Regular mode anchor).
+  var testDateStr = settings.test_date || settings.regular_arrival_at;
   if (!testDateStr)
-    return { sent: 0, failed: 0, unlinked: 0, error: "No test date set" };
+    return { sent: 0, failed: 0, unlinked: 0, error: "No test/arrival date set" };
 
   // Format test date for display
   var testDate = new Date(testDateStr);
@@ -1181,7 +1187,8 @@ async function sendAllReminders(db, token) {
           header,
           true,
           reg.CandidateNumber || reg.candidatenumber,
-          botTexts
+          botTexts,
+          buildRegularCtx(settings)
         );
 
         try {
@@ -1281,6 +1288,15 @@ const DEFAULT_BOT_TEXTS = {
     "• Arrive 10 minutes early with a pen/pencil and paper.\n" +
     "{alarm}" +
     "\nGood luck! 🍀",
+  // Regular-mode templates — used when a registration row has no MainTime/SpeakingTime.
+  // Same {name}/{alarm} substitution pattern as the CDI templates.
+  bot_text_regular_header:
+    "📋 <b>Mock Test Reminder</b>\n\nHello, {name}! 👋\n\nYour mock test is <b>TOMORROW</b>.",
+  bot_text_regular_tips:
+    "💡 <b>Important Tips:</b>\n" +
+    "• Arrive 10 minutes early with your student ID.\n" +
+    "{alarm}" +
+    "\nGood luck! 🍀",
 };
 
 // Read admin overrides from Settings, fall back to defaults. Returns a flat object.
@@ -1306,7 +1322,58 @@ function applyBotVars(template, vars) {
   });
 }
 
-function formatStudentNotification(name, session, examType, speakTime, mainTime, testDateStr, school, prefixText, isReminder, candidateNumber, botTexts) {
+// Build the Regular-mode context from Settings KV. Callers pass the result
+// into formatStudentNotification so it has the arrival/instructions data
+// when dispatching to the Regular template.
+function buildRegularCtx(settings) {
+  if (!settings) return { arrivalDisplay: "", instructions: "" };
+  var arrival = settings.regular_arrival_at || "";
+  var arrivalDisplay = "";
+  if (arrival) {
+    var d = new Date(arrival);
+    if (!isNaN(d.getTime())) {
+      var dUZT = new Date(d.getTime() + UZT_OFFSET_MS);
+      var pad = function (n) { return n < 10 ? "0" + n : "" + n; };
+      arrivalDisplay = dUZT.getUTCDate() + " " + MONTHS[dUZT.getUTCMonth()] + " " +
+        dUZT.getUTCFullYear() + ", " + pad(dUZT.getUTCHours()) + ":" + pad(dUZT.getUTCMinutes());
+    }
+  }
+  return { arrivalDisplay: arrivalDisplay, instructions: settings.regular_instructions || "" };
+}
+
+// Build a Regular-mode notification body. Uses the same {name}/{alarm}
+// substitution pattern as CDI but the body is code-driven from event data
+// (arrival time + admin instructions + location).
+function formatRegularNotification(p) {
+  var texts = p.texts || DEFAULT_BOT_TEXTS;
+  var locationLine = texts.bot_text_location_line || DEFAULT_BOT_TEXTS.bot_text_location_line;
+  var arrivalDisplay = p.regularCtx.arrivalDisplay || "";
+  var instructions = p.regularCtx.instructions || "";
+
+  var msg = p.prefixText + "\n\n";
+  if (p.candidateNumber) msg += "🆔 Candidate No: <code>" + escHtml(p.candidateNumber) + "</code>\n";
+  if (p.name) msg += "👤 Name: <b>" + escHtml(p.name) + "</b>\n";
+  if (p.testDateStr) msg += "📅 Date: <b>" + escHtml(p.testDateStr) + "</b>\n";
+  if (arrivalDisplay) msg += "🕒 Arrival: <b>" + escHtml(arrivalDisplay) + "</b>\n";
+  else if (p.session) msg += "🕒 " + escHtml(p.session) + "\n";
+  msg += "\n" + locationLine + "\n";
+  if (instructions) msg += "\n📝 " + escHtml(instructions) + "\n";
+  if (p.school) msg += "\n🏫 School: " + escHtml(p.school);
+
+  if (p.isReminder) {
+    var alarmLine = "";
+    // Try to suggest an alarm time from the arrival HH:MM segment (e.g. "Regular @ 09:00").
+    var hhmm = /\b(\d{1,2}:\d{2})\b/.exec(arrivalDisplay || p.session || "");
+    if (hhmm) {
+      var alarm = suggestAlarm(hhmm[1]);
+      if (alarm) alarmLine = "• Set an alarm for <b>" + alarm + "</b> so you don't miss it!\n";
+    }
+    msg += "\n\n" + applyBotVars(texts.bot_text_regular_tips, { alarm: alarmLine });
+  }
+  return msg;
+}
+
+function formatStudentNotification(name, session, examType, speakTime, mainTime, testDateStr, school, prefixText, isReminder, candidateNumber, botTexts, regularCtx) {
   var s = String(session || "").replace(/ \(est\.\)$/, "").trim();
   var et = String(examType || "").trim();
   var st = String(speakTime || "").replace(/ \(est\.\)$/, "").trim();
@@ -1314,6 +1381,24 @@ function formatStudentNotification(name, session, examType, speakTime, mainTime,
 
   var texts = botTexts || DEFAULT_BOT_TEXTS;
   var locationLine = texts.bot_text_location_line || DEFAULT_BOT_TEXTS.bot_text_location_line;
+
+  // Shape-based dispatch: a row without explicit Main/Speak times AND a
+  // Session that looks like "Regular …" is a Regular registration. Render
+  // with the arrival-time/instructions template instead of the CDI schedule.
+  var isRegularRow = !mt && !st && /^regular\b/i.test(s);
+  if (isRegularRow) {
+    return formatRegularNotification({
+      name: name,
+      session: s,
+      testDateStr: testDateStr,
+      school: school,
+      prefixText: prefixText,
+      isReminder: isReminder,
+      candidateNumber: candidateNumber,
+      texts: texts,
+      regularCtx: regularCtx || {},
+    });
+  }
 
   var msg = prefixText + "\n\n";
   if (candidateNumber) msg += "🆔 Candidate No: <code>" + escHtml(candidateNumber) + "</code>\n";
@@ -1724,6 +1809,10 @@ function parseTimeToMin(timeStr) {
 async function validateScheduling(db, registrations, payload) {
   if (!payload) return null;
   const settings = (await db.get("Settings", "json")) || {};
+  // Regular mode has no sessions and no seat caps — nothing to validate beyond
+  // the deadline gate (handled client-side + by the duplicate-phone check).
+  const mode = String(settings.registration_mode || "").trim();
+  if (mode === "regular") return null;
   const cfgRaw = settings.session_config;
   if (!cfgRaw) return null; // No config saved yet → nothing to validate against
   let sessions;
@@ -1820,7 +1909,9 @@ async function handleScheduled(env, ctx) {
       }
     }
 
-    var actualTestDateStr = settings.test_date;
+    // In Regular mode, fall back to regular_arrival_at as the anchor so admin
+    // doesn't have to set two separate dates. test_date still wins when set.
+    var actualTestDateStr = settings.test_date || settings.regular_arrival_at;
     if (!actualTestDateStr) return;
     var testDate = new Date(actualTestDateStr);
     if (isNaN(testDate.getTime())) return;

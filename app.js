@@ -64,6 +64,7 @@ var MS_PER_MINUTE = 60000;
 var adminStudentFilter = ""; // search filter for students tab
 var adminStudentsLoadedAt = 0; // timestamp of last students load
 var adminDayDraft = null; // working copy of dayConfig during admin edit
+var adminRegularDraft = null; // working copy of regularConfig during admin edit
 
 // --- Bot admin tab state ---
 var adminBotSubtab = "texts"; // 'texts' | 'broadcast' | 'schedules' | 'stats'
@@ -113,7 +114,12 @@ var SPEAKING_GAP_DEFAULT = 10;
 var MAIN_DURATION = MAIN_DURATION_DEFAULT;
 var SPEAK_DURATION = SPEAK_DURATION_DEFAULT;
 var SPEAKING_GAP = SPEAKING_GAP_DEFAULT;
-var registrationMode = "lr_only"; // 'lr_only' | 'main_speaking'
+// Global registration mode: "cdi" (per-session picker, current default) or
+// "regular" (no session list — every student arrives at one universal time).
+// Legacy values "lr_only" and "main_speaking" both map to "cdi" on read.
+var registrationMode = "cdi";
+// Regular-mode config (only loaded/used when registrationMode === "regular").
+var regularConfig = { arrivalAt: "", instructions: "" };
 var examType = null; // legacy — kept for migration of old localStorage
 
 // --- Local registration storage ---
@@ -371,6 +377,19 @@ async function loadSeats() {
   await loadSessionConfig();
   await loadDeadline();
   normalizeDayConfig();
+
+  // Regular mode skips the entire Seats infrastructure — no pools, no caps.
+  if (registrationMode === "regular") {
+    loadError = false;
+    var existingReg = getRegistration();
+    if (existingReg) {
+      step = 3;
+    } else {
+      step = 2;
+    }
+    render();
+    return;
+  }
 
   try {
     var res = await fetch(API + "?sheet=Seats");
@@ -784,6 +803,16 @@ function getDoorsOpenTime(label) {
 }
 
 function renderProgressBar(activeStep) {
+  // Regular mode has a single step (details) — render a simple full bar.
+  if (registrationMode === "regular") {
+    return (
+      '<div class="dl-progress-wrap">' +
+      '<div class="dl-progress-labels"><span class="current">Your details</span></div>' +
+      '<div class="dl-progress">' +
+      '<div class="dl-progress-fill" style="width:100%"></div>' +
+      '</div></div>'
+    );
+  }
   // Show 3 steps whenever at least one session has speaking enabled. Before
   // the student picks a session we don't know which they'll choose, so we
   // optimistically show 3 steps if any speaking session exists.
@@ -1100,7 +1129,74 @@ function renderExamType() {
   );
 }
 
+// Format a stored regular_arrival_at ISO into "HH:MM" or "" if unset/invalid.
+function regularArrivalHHMM() {
+  if (!regularConfig.arrivalAt) return "";
+  var d = new Date(regularConfig.arrivalAt);
+  if (isNaN(d.getTime())) return "";
+  var h = d.getHours(), m = d.getMinutes();
+  return (h < 10 ? "0" : "") + h + ":" + (m < 10 ? "0" : "") + m;
+}
+function regularArrivalFull() {
+  if (!regularConfig.arrivalAt) return "";
+  var d = new Date(regularConfig.arrivalAt);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleString("en-GB", {
+    weekday: "short", day: "2-digit", month: "short", year: "numeric",
+    hour: "2-digit", minute: "2-digit",
+  });
+}
+
 function renderStep2() {
+  // Regular mode — no session was chosen; show arrival pill + instructions.
+  if (registrationMode === "regular") {
+    var arrivalDisp = regularArrivalFull();
+    var instr = regularConfig.instructions || "";
+    var deadlineBanner = "";
+    if (isRegistrationClosed()) {
+      return (
+        '<div class="deadline-banner">' +
+        "<strong>Registration is closed.</strong><br>" +
+        "The deadline was " + formatDeadline(deadline) + "." +
+        "</div>"
+      );
+    }
+    var progressHtml = renderProgressBar(2);
+    var ajSel = form.school === "adam_johns";
+    var otSel = form.school === "other";
+    var recapHtml = '<div class="selected-slot-recap"><div>' +
+      '<div style="font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:3px">Arrival time</div>' +
+      '<div class="recap-time">' + (arrivalDisp ? esc(arrivalDisp) : 'Not set — ask admin') + '</div></div></div>';
+    var instructionsHtml = instr
+      ? '<div class="sched-box"><div class="sched-title">Instructions</div><div style="font-size:13px;line-height:1.5;white-space:pre-wrap">' + esc(instr) + '</div></div>'
+      : '';
+    return (
+      progressHtml +
+      recapHtml +
+      instructionsHtml +
+      '<div class="section-label">Your details</div>' +
+      '<div class="field-group"><label class="field-label">Full name</label>' +
+      '<input id="inp-name" class="field-input ' + (errors.name ? "error error-shake" : "") + '" type="text" value="' + esc(form.name) + '" placeholder="e.g. Amir Karimov" maxlength="80" autocomplete="name" />' +
+      (errors.name ? '<div class="error-msg" id="err-name">' + errors.name + "</div>" : "") +
+      "</div>" +
+      '<div class="field-group"><label class="field-label">Phone number</label>' +
+      '<div class="phone-wrap"><div class="phone-prefix">+998</div>' +
+      '<input id="inp-phone" class="field-input ' + (errors.phone ? "error error-shake" : "") + '" type="tel" value="' + esc(form.phone) + '" placeholder="90-999-99-99" maxlength="12" style="flex:1" autocomplete="tel" /></div>' +
+      (errors.phone ? '<div class="error-msg" id="err-phone">' + errors.phone + "</div>" : "") +
+      "</div>" +
+      '<div class="field-group" style="margin-top:1.25rem"><div class="section-label">Where do you study?</div>' +
+      '<div class="radio-group">' +
+      '<div class="radio-card ' + (ajSel ? "selected" : "") + '" data-val="adam_johns" onclick="setSchool(\'adam_johns\')"><div class="radio-circle ' + (ajSel ? "on" : "") + '"></div><span class="radio-text">Adam &amp; John\'s</span></div>' +
+      '<div class="radio-card ' + (otSel ? "selected" : "") + '" data-val="other" onclick="setSchool(\'other\')"><div class="radio-circle ' + (otSel ? "on" : "") + '"></div><span class="radio-text">Other school</span></div>' +
+      "</div>" +
+      (errors.school ? '<div class="error-msg" id="err-school">' + errors.school + "</div>" : "") +
+      "</div>" +
+      '<button class="btn-primary" onclick="submitForm()" ' + (submitting ? "disabled" : "") + ">" +
+      (submitting ? "Registering…" : "Complete registration") +
+      "</button>"
+    );
+  }
+
   var slotInfo = SLOTS.find(function (s) {
     return s.id === form.slot;
   });
@@ -1242,6 +1338,14 @@ function renderManage() {
     '<div class="booking-row"><span class="booking-row-label">School</span><span class="booking-row-val">' +
     esc(reg.school) +
     "</span></div>" +
+    // Instructions row appears for Regular registrations (mode-agnostic check)
+    (reg.regular && (reg.instructions || regularConfig.instructions)
+      ? '<div class="booking-row" style="flex-direction:column;align-items:flex-start;gap:6px">' +
+        '<span class="booking-row-label">Instructions</span>' +
+        '<span class="booking-row-val" style="white-space:pre-wrap;font-weight:400;text-align:left">' +
+        esc(reg.instructions || regularConfig.instructions) +
+        '</span></div>'
+      : "") +
     "</div>" +
     '<div id="tg-reminder-card" style="display:flex;align-items:center;gap:12px;background:rgba(36,161,222,0.1);border:1px solid rgba(36,161,222,0.2);border-radius:12px;padding:14px 16px;margin:16px 0">' +
     '<div style="font-size:22px;flex-shrink:0">&#128172;</div>' +
@@ -1251,16 +1355,18 @@ function renderManage() {
     '</div>' +
     '<a href="' + tgLink + '" target="_blank" rel="noopener" style="display:inline-block;background:#24a1de;color:#fff;font-size:13px;font-weight:600;padding:8px 16px;border-radius:8px;text-decoration:none;white-space:nowrap">Open Bot</a>' +
     '</div>' +
-    (isRegistrationClosed()
-      ? '<div class="deadline-warning">' +
-        '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>' +
-        '<span>Registration deadline has passed &mdash; session changes are no longer available.</span>' +
-        '</div>' +
-        '<button class="btn-green" disabled style="opacity:0.45;cursor:not-allowed">Change my session</button>' +
-        ''
-      : '<button class="btn-green" onclick="goChangeSlot()" ' +
-        (submitting ? "disabled" : "") +
-        ">Change my session</button>") +
+    (reg.regular
+      ? "" // Regular mode has no session-picking → no Change button
+      : isRegistrationClosed()
+        ? '<div class="deadline-warning">' +
+          '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>' +
+          '<span>Registration deadline has passed &mdash; session changes are no longer available.</span>' +
+          '</div>' +
+          '<button class="btn-green" disabled style="opacity:0.45;cursor:not-allowed">Change my session</button>' +
+          ''
+        : '<button class="btn-green" onclick="goChangeSlot()" ' +
+          (submitting ? "disabled" : "") +
+          ">Change my session</button>") +
     "" +
     (isRegistrationClosed()
       ? '<button class="btn-danger" disabled style="opacity:0.45;cursor:not-allowed">Cancel my registration</button>'
@@ -1378,6 +1484,14 @@ function render() {
   // Push state to history so mobile back button works properly
   if (!history.state || history.state.step !== step) {
     history.pushState({ step: step }, "", "#step" + step);
+  }
+
+  // Subtitle adapts to mode — Regular has no session-picker.
+  var subEl = document.getElementById("header-subtitle");
+  if (subEl) {
+    subEl.textContent = registrationMode === "regular"
+      ? "Enter your details below to register"
+      : "Select a session and complete your details below";
   }
 
   var el = document.getElementById("main");
@@ -1723,8 +1837,11 @@ function validate() {
   if (!form.phone.trim()) e.phone = "Phone number is required";
   else if (digits.length < 9) e.phone = "Enter 9 digits, e.g. 90-999-99-99";
   if (!form.school) e.school = "Please select where you study";
-  if (!form.slot || VALID_SLOT_IDS.indexOf(form.slot) === -1)
-    e.slot = "Please select a valid session";
+  // Slot is only required in CDI mode — Regular mode has no session picker.
+  if (registrationMode !== "regular") {
+    if (!form.slot || VALID_SLOT_IDS.indexOf(form.slot) === -1)
+      e.slot = "Please select a valid session";
+  }
   return e;
 }
 
@@ -1744,6 +1861,53 @@ async function submitForm() {
     render();
     return;
   }
+
+  // ── Regular mode submit: no slot, no seats, minimal payload ──────────
+  if (registrationMode === "regular") {
+    submitting = true;
+    var rBtn = document.querySelector(".btn-primary");
+    if (rBtn) { rBtn.disabled = true; rBtn.innerHTML = '<svg class="btn-spinner" viewBox="0 0 50 50"><circle cx="25" cy="25" r="20" fill="none" stroke-width="5"></circle></svg> Registering…'; }
+    try {
+      var rSchool = form.school === "adam_johns" ? "Adam & John's" : "Other";
+      var rClean = form.phone.replace(/\D/g, "");
+      var arrivalHHMM = regularArrivalHHMM();
+      var rPayload = {
+        Timestamp: new Date().toISOString(),
+        Name: form.name.trim(),
+        Phone: "998" + rClean,
+        Session: arrivalHHMM ? "Regular @ " + arrivalHHMM : "Regular",
+        School: rSchool,
+      };
+      var rResp = await addRegistration(rPayload);
+      var rReg = {
+        name: form.name.trim(),
+        phone: form.phone,
+        slotId: "regular",
+        slotLabel: arrivalHHMM ? "Regular @ " + arrivalHHMM : "Regular",
+        school: rSchool,
+        regular: true,
+        arrivalAt: regularConfig.arrivalAt,
+        instructions: regularConfig.instructions,
+        candidateNumber: (rResp && rResp.candidateNumber) || rPayload.CandidateNumber,
+      };
+      saveRegistration(rReg);
+      submitting = false;
+      step = 3;
+      render();
+    } catch (err) {
+      submitting = false;
+      var rb = document.querySelector(".btn-primary");
+      if (rb) { rb.disabled = false; rb.innerHTML = "Complete registration"; }
+      if (err.message === "DUPLICATE_PHONE") {
+        errors.phone = "A user with this phone number is already registered.";
+        render();
+      } else {
+        alert("Submission failed: " + err.message);
+      }
+    }
+    return;
+  }
+
   var slotInfo = SLOTS.find(function (s) {
     return s.id === form.slot;
   });
@@ -1933,9 +2097,11 @@ async function cancelRegistration() {
   try {
     await performCancellationLogic(reg);
     clearRegistration();
-    form = { slot: null, name: "", phone: "", school: "" };
+    form = { slot: null, speak: null, name: "", phone: "", school: "" };
     examType = null;
-    step = 1;
+    // Regular mode has no step 1 — bounce to the details form so the student
+    // can register again immediately if they want.
+    step = registrationMode === "regular" ? 2 : 1;
     render();
   } catch (err) {
     if (cancelBtn) {
@@ -2125,6 +2291,9 @@ function migrateLegacySession(s) {
 
 async function loadSessionConfig() {
   sessionConfigError = null;
+  // Wrap the session-config branch in an IIFE so an early return only skips
+  // the CDI session list, NOT the mode/Regular config loads below.
+  await (async function loadSessionsOnly() {
   try {
     var res = await fetch(API + "/search?sheet=Settings&Key=session_config");
     if (!res.ok) return; // Use defaults if not found
@@ -2158,6 +2327,7 @@ async function loadSessionConfig() {
   } catch (e) {
     sessionConfigError = "Session config error: " + e.message;
   }
+  })();
   // Day-level config
   try {
     var dr = await fetch(API + "/search?sheet=Settings&Key=session_day_config");
@@ -2177,17 +2347,50 @@ async function loadSessionConfig() {
     }
   } catch (e3) {}
   normalizeDayConfig();
-  // Load registration mode
+  // Load registration mode (with legacy migration)
   try {
     var mr = await fetch(API + "/search?sheet=Settings&Key=registration_mode");
     if (mr.ok) {
       var mrows = await mr.json();
       if (mrows && mrows.length) {
-        var mv = mrows[0]["Value"] || mrows[0]["value"];
-        if (mv === "main_speaking" || mv === "lr_only") registrationMode = mv;
+        var mv = String(mrows[0]["Value"] || mrows[0]["value"] || "").trim();
+        if (mv === "regular") registrationMode = "regular";
+        else if (mv === "cdi" || mv === "lr_only" || mv === "main_speaking") registrationMode = "cdi";
+        // empty / unknown → keep default "cdi"
       }
     }
   } catch (e2) {}
+  // Load Regular-mode config (idempotent — these may not exist yet)
+  try {
+    var ra = await fetch(API + "/search?sheet=Settings&Key=regular_arrival_at");
+    if (ra.ok) {
+      var raRows = await ra.json();
+      if (raRows && raRows.length) regularConfig.arrivalAt = String(raRows[0]["Value"] || raRows[0]["value"] || "");
+    }
+  } catch (e3) {}
+  try {
+    var ri = await fetch(API + "/search?sheet=Settings&Key=regular_instructions");
+    if (ri.ok) {
+      var riRows = await ri.json();
+      if (riRows && riRows.length) regularConfig.instructions = String(riRows[0]["Value"] || riRows[0]["value"] || "");
+    }
+  } catch (e4) {}
+}
+
+async function saveRegularConfig(cfg) {
+  // Two PATCH calls — same plumbing as deadline/test_date.
+  var resA = await fetch(API + "/Key/regular_arrival_at?sheet=Settings", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH },
+    body: JSON.stringify({ data: { Value: cfg.arrivalAt || "" } }),
+  });
+  if (!resA.ok) throw new Error("regular_arrival_at: HTTP " + resA.status);
+  var resB = await fetch(API + "/Key/regular_instructions?sheet=Settings", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH },
+    body: JSON.stringify({ data: { Value: cfg.instructions || "" } }),
+  });
+  if (!resB.ok) throw new Error("regular_instructions: HTTP " + resB.status);
 }
 
 async function saveDayConfig(dc) {
@@ -2688,7 +2891,10 @@ function renderAdminPanelHTML() {
     '" onclick="adminSwitchTab(\'deadline\')">Deadline</button>' +
     '<button class="admin-tab' +
     (adminActiveTab === "sessions" ? " active" : "") +
-    '" onclick="adminSwitchTab(\'sessions\')">Sessions</button>' +
+    '" onclick="adminSwitchTab(\'sessions\')">' + (registrationMode === "regular" ? "Event" : "Sessions") + '</button>' +
+    '<button class="admin-tab' +
+    (adminActiveTab === "mode" ? " active" : "") +
+    '" onclick="adminSwitchTab(\'mode\')">Mode</button>' +
     '<button class="admin-tab' +
     (adminActiveTab === "students" ? " active" : "") +
     '" onclick="adminSwitchTab(\'students\')">Students' + studentsBadge + '</button>' +
@@ -2834,10 +3040,69 @@ function renderAdminPanelHTML() {
     );
   }
 
-  // (Mode tab was removed — per-session "Speaking enabled" toggle in
-  // Sessions tab replaces the global L+R-only / Main+Speaking switch.)
+  // Mode tab — Regular vs CDI.
+  if (adminActiveTab === "mode") {
+    var isRegular = registrationMode === "regular";
+    return (
+      '<div class="admin-panel"><div class="admin-title">Settings</div>' +
+      tabs +
+      '<div style="font-size:13px;color:var(--muted);margin-bottom:14px">Choose how students register for this event.</div>' +
+      '<div class="mode-card' +
+      (!isRegular ? " mode-on" : "") +
+      '" onclick="adminSetMode(\'cdi\')">' +
+      '<div class="mode-card-title">CDI (sessions)' +
+      (!isRegular ? ' <span class="mode-badge">ACTIVE</span>' : "") +
+      "</div>" +
+      '<div class="mode-card-desc">Students choose from multiple session times you configure in the Sessions tab. Each session can be Main only or Main + Speaking via its own toggle.</div>' +
+      "</div>" +
+      '<div class="mode-card' +
+      (isRegular ? " mode-on" : "") +
+      '" onclick="adminSetMode(\'regular\')">' +
+      '<div class="mode-card-title">Regular' +
+      (isRegular ? ' <span class="mode-badge">ACTIVE</span>' : "") +
+      "</div>" +
+      '<div class="mode-card-desc">Single arrival time for every student. Students skip session-picking and go straight to the details form. No seat caps — deadline gates registration.</div>' +
+      "</div>" +
+      '<div id="admin-mode-status" class="admin-status"></div>' +
+      '<button class="btn-secondary" onclick="closeAdmin()">Close</button>' +
+      '<button class="btn-secondary" style="margin-top:4px;color:var(--red);border-color:var(--red-border)" onclick="adminLogout()">Log out</button></div>'
+    );
+  }
 
-  // Sessions tab
+  // Sessions tab — branches by mode. In Regular mode it becomes an "Event
+  // details" editor (single arrival time + instructions). In CDI mode it
+  // shows the full session-list editor + capacity preview.
+  if (registrationMode === "regular") {
+    var rcfg = adminRegularDraft || {
+      arrivalAt: regularConfig.arrivalAt || "",
+      instructions: regularConfig.instructions || "",
+    };
+    adminRegularDraft = rcfg;
+    var arrivalStr = "";
+    if (rcfg.arrivalAt) {
+      var d = new Date(rcfg.arrivalAt);
+      if (!isNaN(d.getTime())) arrivalStr = toLocalDatetimeString(d);
+    }
+    return (
+      '<div class="admin-panel"><div class="admin-title">Event details</div>' +
+      tabs +
+      '<div style="font-size:12px;color:var(--muted);margin-bottom:12px">Regular mode is active. Set one universal arrival time and any extra instructions students should see. The registration deadline lives in the Deadline tab.</div>' +
+      '<div style="margin-top:12px"><label style="font-size:13px;font-weight:500;color:var(--text);display:block;margin-bottom:6px">Arrival datetime</label>' +
+      '<input id="admin-regular-arrival" class="admin-input" type="datetime-local" value="' + esc(arrivalStr) + '" oninput="adminRegularDraft.arrivalAt = (function(v){ if(!v) return ""; var p = v.split(/[\\-T:]/); var d = new Date(+p[0], +p[1]-1, +p[2], +p[3], +p[4]); return isNaN(d.getTime()) ? "" : d.toISOString(); })(this.value)" />' +
+      '</div>' +
+      '<div style="margin-top:12px"><label style="font-size:13px;font-weight:500;color:var(--text);display:block;margin-bottom:6px">Extra instructions <span style="color:var(--muted);font-weight:400">(shown in confirmation + bot DMs)</span></label>' +
+      '<textarea id="admin-regular-instructions" class="admin-input" rows="4" style="width:100%;resize:vertical" oninput="adminRegularDraft.instructions = this.value" placeholder="e.g. Bring two photos and your passport. Doors open 10 min before arrival.">' + esc(rcfg.instructions) + '</textarea>' +
+      '</div>' +
+      '<div id="admin-sessions-status" class="admin-status"></div>' +
+      '<button class="btn-primary" style="margin-top:12px" onclick="adminSaveRegular()">Save event details</button>' +
+      '<button class="btn-secondary" onclick="adminRegularDraft=null;render()">Discard changes</button>' +
+      '<button class="btn-secondary" onclick="closeAdmin()">Close</button>' +
+      '<button class="btn-secondary" style="margin-top:4px;color:var(--red);border-color:var(--red-border)" onclick="adminLogout()">Log out</button>' +
+      '</div>'
+    );
+  }
+
+  // CDI mode — full session list editor below.
   var draft =
     adminSessionDraft ||
     SLOTS.map(function (s) {
@@ -3190,7 +3455,40 @@ function adminToggleDerivedClose() {
   }
   render();
 }
+async function adminSaveRegular() {
+  if (!adminRegularDraft) return;
+  var statusEl = document.getElementById("admin-sessions-status");
+  var btn = document.querySelector(".admin-panel .btn-primary");
+  if (btn) { btn.disabled = true; btn.textContent = "Saving…"; }
+  try {
+    // Read current values from DOM to avoid losing focus-typed edits
+    var arrivalEl = document.getElementById("admin-regular-arrival");
+    var insEl = document.getElementById("admin-regular-instructions");
+    if (arrivalEl && arrivalEl.value) {
+      var p = arrivalEl.value.split(/[\-T:]/);
+      var d = new Date(+p[0], +p[1] - 1, +p[2], +p[3], +p[4]);
+      adminRegularDraft.arrivalAt = isNaN(d.getTime()) ? "" : d.toISOString();
+    } else if (arrivalEl) {
+      adminRegularDraft.arrivalAt = "";
+    }
+    if (insEl) adminRegularDraft.instructions = insEl.value;
+
+    await saveRegularConfig(adminRegularDraft);
+    regularConfig.arrivalAt = adminRegularDraft.arrivalAt;
+    regularConfig.instructions = adminRegularDraft.instructions;
+    if (statusEl) { statusEl.textContent = "Event details saved!"; statusEl.className = "admin-status ok"; }
+    showToast("Event details saved", "success");
+    adminRegularDraft = null;
+    setTimeout(render, 800);
+  } catch (e) {
+    if (statusEl) { statusEl.textContent = "Save failed: " + e.message; statusEl.className = "admin-status err"; }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Save event details"; }
+  }
+}
+
 async function adminSetMode(mode) {
+  if (mode !== "cdi" && mode !== "regular") return;
   var statusEl = document.getElementById("admin-mode-status");
   if (mode === registrationMode) return;
   if (statusEl) {
@@ -3200,6 +3498,15 @@ async function adminSetMode(mode) {
   try {
     await saveModeConfig(mode);
     registrationMode = mode;
+    // After flipping mode, re-derive day config and re-run loadSeats path
+    // so the live state matches the new mode without a hard refresh.
+    if (mode === "regular") {
+      // Reset any stale CDI seat caps so they don't leak into Regular UI.
+      // (We don't clear seats — admin may flip back to CDI later.)
+    } else {
+      // Returning to CDI — re-normalize day window in case it shifted.
+      normalizeDayConfig();
+    }
     if (statusEl) {
       statusEl.textContent = "Mode updated!";
       statusEl.className = "admin-status ok";
@@ -3452,9 +3759,11 @@ window.addEventListener("popstate", function(e) {
     step = e.state.step;
     render();
   } else {
-    // If no state (loaded root), check if already registered
+    // If no state (loaded root), check if already registered. Regular mode
+    // has no step 1, so first-step routes to step 2 (details) directly.
     var existing = getRegistration();
-    step = existing ? 3 : 1;
+    if (existing) step = 3;
+    else step = registrationMode === "regular" ? 2 : 1;
     render();
   }
 });
