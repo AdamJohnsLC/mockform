@@ -2794,6 +2794,16 @@ async function adminLogin() {
   }
 }
 
+// The public "home" screen depends on mode + registration state, mirroring the
+// page-load/popstate bootstrap: an existing registration → manage (3); Regular
+// mode → details form (2, there is no session-picker step 1); CDI → picker (1).
+// Used by the admin-exit paths so switching mode then leaving lands correctly
+// instead of stranding the user on the step-1 session list (the "CDI" view).
+function homeStep() {
+  if (getRegistration()) return 3;
+  return registrationMode === "regular" ? 2 : 1;
+}
+
 function closeAdmin() {
   if (adminSaveTimer) {
     clearTimeout(adminSaveTimer);
@@ -2802,7 +2812,7 @@ function closeAdmin() {
   adminSessionDraft = null;
   // Keep adminAuthenticated = true so user can re-enter via FAB
   adminStatus = "";
-  step = 1;
+  step = homeStep();
   render();
 }
 
@@ -2811,7 +2821,7 @@ function adminLogout() {
   try { sessionStorage.removeItem("adminAuth"); } catch (e) {}
   adminStatus = "";
   adminSessionDraft = null;
-  step = 1;
+  step = homeStep();
   render();
   showToast("Logged out of admin", "info");
 }
@@ -3757,13 +3767,14 @@ async function adminClearDates() {
 window.addEventListener("popstate", function(e) {
   if (e.state && typeof e.state.step === 'number') {
     step = e.state.step;
+    // Regular mode has no step 1 (the session picker). A stale history entry
+    // from before a mode switch can point there — land on the real home instead
+    // so Back doesn't show the CDI session list in Regular mode.
+    if (step === 1 && registrationMode === "regular") step = homeStep();
     render();
   } else {
-    // If no state (loaded root), check if already registered. Regular mode
-    // has no step 1, so first-step routes to step 2 (details) directly.
-    var existing = getRegistration();
-    if (existing) step = 3;
-    else step = registrationMode === "regular" ? 2 : 1;
+    // If no state (loaded root), route to the mode-appropriate home.
+    step = homeStep();
     render();
   }
 });
