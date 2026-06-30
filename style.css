@@ -9,6 +9,7 @@
   --border-focus: #d8d8d4;
   --text: #0a0a0a;
   --muted: #6e6e76;
+  --primary: var(--accent);
   
   --accent: #5b5bd6;
   --accent-dim: rgba(91, 91, 214, 0.08);
@@ -49,6 +50,7 @@
   --border-focus: rgba(255, 255, 255, 0.12);
   --text: #f0f0f2;
   --muted: #9a9aa6;
+  --primary: var(--accent);
   
   --accent: #8e8eff;
   --accent-dim: rgba(142, 142, 255, 0.12);
@@ -559,6 +561,7 @@ body::before {
     .err-banner { background:var(--red-dim); border:1px solid var(--red-border); border-radius:8px; padding:12px 16px; font-size:13px; color:var(--red); text-align:center; margin-bottom:1rem; font-weight: 500; }
     
     /* admin */
+    #app.admin-mode { max-width: 720px; }
     .admin-panel { width:100%; animation: adminFadeIn 0.2s ease-out; }
     @keyframes adminFadeIn { from { opacity: 0; } to { opacity: 1; } }
     .admin-title { font-family:'Geist','Outfit',sans-serif; font-size:20px; font-weight:600; color:var(--text); margin-bottom:6px; transition: color 0.3s ease; }
@@ -595,6 +598,7 @@ body::before {
     .enable-all-btn:hover { background:rgba(230,138,58,0.12); }
     .admin-input { width:100%; height:42px; padding:0 12px; border:1px solid var(--border2); border-radius:8px; font-size:15px; font-family:'Geist','Outfit',sans-serif; color:var(--text); background:var(--surface); outline:none; margin-bottom:10px; transition: all 0.2s; }
     input[type='datetime-local'].admin-input { height:auto; padding:10px 12px; }
+    textarea.admin-input { height:auto; }
     .admin-input:focus { border-color:var(--text); box-shadow: 0 0 0 4px var(--accent-glow); }
     .admin-row { display:flex; gap:8px; margin-bottom:10px; }
     .admin-row .admin-input { margin-bottom:0; }
@@ -839,4 +843,24 @@ body::before {
       }
       .speak-cell { padding: 8px 6px; }
       .speak-time { font-size: 13px; }
+
+      .admin-tabs {
+        overflow-x: auto;
+        white-space: nowrap;
+        display: flex;
+        gap: 8px;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: none;
+        border-bottom: 1px solid var(--border2);
+        padding-bottom: 4px;
+        margin-bottom: 1rem;
+      }
+      .admin-tabs::-webkit-scrollbar {
+        display: none;
+      }
+      .admin-tab {
+        flex: 0 0 auto;
+        padding: 8px 12px;
+        font-size: 12px;
+      }
     }

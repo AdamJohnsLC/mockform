@@ -2,7 +2,7 @@
 
 // Replace this URL once you deploy your Google Apps Script!
 const APP_SCRIPT_URL =
-  "https://script.google.com/macros/s/AKfycbxbeKZKTqZzMacAtntjE1zlgO3iJXAcnIYdjghNm0FqPg8n4a1iXS3P_AuiNWN5hT3g/exec";
+  "https://script.google.com/macros/s/AKfycbxRzENke9rtXj2GPdZU7ztYEUlim3f8n0SB_7Nas1rJ4GVOwb-y-eq_Sko28OI2kc-v/exec";
 
 const ALLOWED_PATH =
   /^(\/?|\/search|\/Slot\/[^/?]+|\/Phone\/[^/?]+|\/Key\/[^/?]+|\/admin\/.+)(\?.*)?$/;
@@ -689,6 +689,9 @@ async function handleBotAsync(update, env) {
     else if (text === "/candidate" || text.includes("Candidate Number")) {
       await botCandidateNumber(db, token, chatId);
     }
+    else if (text === "/results" || text.includes("My Results") || text.includes("Get Results")) {
+      await botResults(db, token, chatId, env);
+    }
     else if (text === "/location" || text.includes("Location")) {
       await botLocation(db, token, chatId);
     }
@@ -725,8 +728,8 @@ function getReplyKeyboard() {
   return { 
     keyboard: [
       [{ text: "📋 My Status" }, { text: "🆔 Candidate Number" }],
-      [{ text: "📍 Location" }, { text: "⚠️ Test Rules" }],
-      [{ text: "❓ Help" }]
+      [{ text: "📊 My Results" }, { text: "📍 Location" }],
+      [{ text: "⚠️ Test Rules" }, { text: "❓ Help" }]
     ],
     resize_keyboard: true, 
     is_persistent: true 
@@ -1015,6 +1018,109 @@ async function botCandidateNumber(db, token, chatId) {
     parse_mode: "HTML",
     reply_markup: getReplyKeyboard()
   });
+}
+
+// /results — search and retrieve IELTS results HTML from Google Drive
+async function botResults(db, token, chatId, env) {
+  var users = await db.get("TelegramUsers", "json");
+  if (!users || typeof users !== "object") users = {};
+
+  // Reverse-lookup: find ALL phone numbers linked to this chatId
+  var matchedPhones = [];
+  var keys = Object.keys(users);
+  for (var i = 0; i < keys.length; i++) {
+    if (users[keys[i]] === chatId) {
+      matchedPhones.push(String(keys[i]).replace(/\D/g, "").slice(-9));
+    }
+  }
+
+  if (matchedPhones.length === 0) {
+    await sendTelegram(token, "sendMessage", {
+      chat_id: chatId,
+      text:
+        "You haven't linked your registration yet.\n\n" +
+        'Register at the mock test website and click the "Get Telegram Reminders" link on your success page.',
+    });
+    return;
+  }
+
+  var regs = await db.get("Registrations", "json");
+  if (!Array.isArray(regs)) regs = [];
+  regs = regs.map(correctRegistration);
+
+  var matchedRegs = [];
+  for (var j = 0; j < regs.length; j++) {
+    var rp = String(regs[j].Phone || regs[j].phone || "").replace(/\D/g, "").slice(-9);
+    if (matchedPhones.includes(rp)) {
+      matchedRegs.push(regs[j]);
+    }
+  }
+
+  if (matchedRegs.length === 0) {
+    await sendTelegram(token, "sendMessage", {
+      chat_id: chatId,
+      text:
+        "⚠️ Your phone is linked but no active registration was found.\n" +
+        "Your registration may have been cancelled or cleared.",
+    });
+    return;
+  }
+
+  // Notify user that search is in progress
+  await sendTelegram(token, "sendMessage", {
+    chat_id: chatId,
+    text: "🔍 Searching for your IELTS Mock exam results in Google Drive...",
+  });
+
+  var targetUrl = env.RESULTS_UPLOAD_URL || "https://script.google.com/macros/s/AKfycbz5tmKzssmwyR6i3Z_JvlwbMfODVySTDoSWJopAep5IeWpr_FEfbfLgmwh9qspYEyF8qg/exec";
+  var filesSent = 0;
+
+  for (var k = 0; k < matchedRegs.length; k++) {
+    var reg = matchedRegs[k];
+    var studentName = reg.Name || reg.name || "Student";
+    var cn = reg.CandidateNumber || reg.candidatenumber || "";
+    if (!cn) continue;
+
+    try {
+      var searchResp = await fetch(targetUrl + "?action=search&candidateNumber=" + encodeURIComponent(cn));
+      if (searchResp.ok) {
+        var searchResult = await searchResp.json();
+        if (searchResult && searchResult.ok && Array.isArray(searchResult.files) && searchResult.files.length > 0) {
+          for (var f = 0; f < searchResult.files.length; f++) {
+            var fileInfo = searchResult.files[f];
+            var fileResp = await fetch(targetUrl + "?action=getFile&fileId=" + fileInfo.id);
+            if (fileResp.ok) {
+              var fileData = await fileResp.json();
+              if (fileData && fileData.ok && fileData.html) {
+                // Send HTML file as a document via Telegram multipart/form-data
+                const formData = new FormData();
+                formData.append("chat_id", chatId);
+                const htmlBlob = new Blob([fileData.html], { type: "text/html" });
+                formData.append("document", htmlBlob, fileData.name || (studentName.replace(/\s+/g, "_") + "_results.html"));
+                formData.append("caption", "📊 IELTS Mock Exam Results for " + studentName);
+
+                await fetch("https://api.telegram.org/bot" + token + "/sendDocument", {
+                  method: "POST",
+                  body: formData
+                });
+                filesSent++;
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error("Results fetch error for " + studentName + " (ID: " + cn + ")", e);
+    }
+  }
+
+  if (filesSent === 0) {
+    await sendTelegram(token, "sendMessage", {
+      chat_id: chatId,
+      text: "📭 No results found for your registration(s) yet.\n\n" +
+            "Please make sure you entered the correct Candidate Number in your IELTS Simulator test and completed the examination.",
+    });
+  }
 }
 
 async function botLocation(db, token, chatId) {
@@ -1406,7 +1512,7 @@ function formatStudentNotification(name, session, examType, speakTime, mainTime,
   if (testDateStr) msg += "📅 Date: <b>" + escHtml(testDateStr) + "</b>\n";
   msg += "🕒 Session: <b>" + escHtml(s) + "</b>\n";
 
-  var sessionMin = getSessionMinutes(s);
+  var mainStartMin = getSessionMinutes(mt || s);
 
   if (et.toLowerCase() === "speaking") {
     msg += "📝 Exam Type: <b>Speaking First</b> (Speaking before main exam)\n";
@@ -1414,19 +1520,18 @@ function formatStudentNotification(name, session, examType, speakTime, mainTime,
     if (mt) msg += "📋 Main Exam: <b>" + escHtml(mt) + "</b>\n";
     msg += "\n" + locationLine + "\n";
 
-    if (!isNaN(sessionMin)) {
-      var mainStart = formatMinutesToHHMM(sessionMin + 160);
-      var speakEnd = formatMinutesToHHMM(sessionMin + 150);
-      msg += "\n⚠️ <i>Note: There is a 10-minute transition break after the speaking session ends at " + speakEnd + ". Your main exam starts at " + mainStart + ".</i>";
+    if (!isNaN(mainStartMin)) {
+      var speakEnd = formatMinutesToHHMM(mainStartMin - 10);
+      msg += "\n⚠️ <i>Note: There is a 10-minute transition break after the speaking session ends at " + speakEnd + ". Your main exam starts at " + (mt || formatMinutesToHHMM(mainStartMin)) + ".</i>";
     }
   } else {
     msg += "📝 Exam Type: <b>Main First</b> (Listening, Reading, Writing first)\n";
     if (st) msg += "🎤 Speaking Time: <b>" + escHtml(st) + "</b>\n";
     msg += "\n" + locationLine + "\n";
 
-    if (!isNaN(sessionMin)) {
-      var mainEnd = formatMinutesToHHMM(sessionMin + 150);
-      var firstSpeak = formatMinutesToHHMM(sessionMin + 160);
+    if (!isNaN(mainStartMin)) {
+      var mainEnd = formatMinutesToHHMM(mainStartMin + 150);
+      var firstSpeak = formatMinutesToHHMM(mainStartMin + 160);
       msg += "\n⚠️ <i>Note: There is a 10-minute transition break after your main exam ends at " + mainEnd + ". Speaking tests start at " + firstSpeak + " (your specific slot is at " + st + ").</i>";
     }
   }
@@ -1878,11 +1983,31 @@ function correctRegistration(reg) {
   return reg;
 }
 
+async function clearGasSheet(env, sheetName) {
+  const targetUrl = env.GAS_URL || APP_SCRIPT_URL;
+  if (!targetUrl || targetUrl.includes("PASTE_YOUR_WEB")) return;
+  try {
+    await fetch(targetUrl, {
+      method: "POST",
+      body: JSON.stringify({
+        method: "DELETE",
+        sheet: sheetName,
+        path: "/clear",
+        query: { sheet: sheetName },
+        body: null
+      }),
+      headers: { "Content-Type": "text/plain" },
+    });
+  } catch (e) {
+    console.error("Failed to clear Google Sheet: " + sheetName, e);
+  }
+}
+
 // ============================================================
 // CRON SCHEDULED HANDLER — runs hourly
 // ============================================================
 // Drives three things:
-// 1) Auto-cleanup of registrations 2 days after the test date.
+// 1) Auto-cleanup of registrations N days after the test date.
 // 2) Multi-entry reminder scheduling (`bot_schedules`) — fires each
 //    entry exactly once when (test_date - hoursBeforeTest) falls in
 //    the past hour.
@@ -1920,8 +2045,15 @@ async function handleScheduled(env, ctx) {
     var nowUZT = new Date(now.getTime() + UZT_OFFSET_MS);
     var testDateUZT = new Date(testDate.getTime() + UZT_OFFSET_MS);
 
-    // --- 1) AUTO-CLEANUP (2 days after test_date) ---
-    var clearDate = new Date(testDate.getTime() + 2 * 24 * 60 * 60 * 1000);
+    // --- 1) AUTO-CLEANUP (adjustable delayDays after test_date) ---
+    var delayDays = 2;
+    if (settings.cleanup_delay_days !== undefined && settings.cleanup_delay_days !== "") {
+      var parsedDays = parseInt(settings.cleanup_delay_days, 10);
+      if (!isNaN(parsedDays) && parsedDays >= 0) {
+        delayDays = parsedDays;
+      }
+    }
+    var clearDate = new Date(testDate.getTime() + delayDays * 24 * 60 * 60 * 1000);
     var clearDateUZT = new Date(clearDate.getTime() + UZT_OFFSET_MS);
     var isClearDayOrAfter =
       (nowUZT.getUTCFullYear() > clearDateUZT.getUTCFullYear()) ||
@@ -1935,10 +2067,14 @@ async function handleScheduled(env, ctx) {
       settings.cleaned_up = actualTestDateStr;
       settings.bot_schedule_fired = "{}"; // reset so next test_date can fire schedules
       await db.put("Settings", JSON.stringify(settings));
+      
+      // Wipe Google Sheets Registrations sheet too!
+      await clearGasSheet(env, "Registrations");
+
       try {
         await sendTelegram(token, "sendMessage", {
           chat_id: ADMIN_TELEGRAM_ID,
-          text: "🧹 <b>Database Auto-Cleaned</b>\n\nThe test day has passed! All registered students and Telegram links have been wiped to prepare for your next test.",
+          text: "🧹 <b>Database & Sheets Auto-Cleaned</b>\n\nThe test day has passed! All registered students, Google Sheets rows, and Telegram links have been wiped to prepare for your next test.",
           parse_mode: "HTML"
         });
       } catch (e) {}

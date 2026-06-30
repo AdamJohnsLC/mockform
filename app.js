@@ -50,6 +50,7 @@ var adminAuthenticated = false;
 var adminStatus = "";
 var deadline = null; // Date object or null
 var testDate = null; // Date object for actual test day (Bot Reminders)
+var cleanupDelayDays = 2; // Auto-cleanup delay in days
 var adminActiveTab = "deadline"; // 'deadline' or 'sessions'
 var adminSessionDraft = null; // working copy while editing sessions
 var adminFailedAttempts = 0;
@@ -1486,6 +1487,15 @@ function render() {
     history.pushState({ step: step }, "", "#step" + step);
   }
 
+  var appEl = document.getElementById("app");
+  if (appEl) {
+    if (step === 99 && adminAuthenticated) {
+      appEl.classList.add("admin-mode");
+    } else {
+      appEl.classList.remove("admin-mode");
+    }
+  }
+
   // Subtitle adapts to mode — Regular has no session-picker.
   var subEl = document.getElementById("header-subtitle");
   if (subEl) {
@@ -2631,6 +2641,15 @@ async function saveTestDate(isoString) {
   if (!res.ok) throw new Error("HTTP " + res.status);
 }
 
+async function saveCleanupDelayDays(val) {
+  var res = await fetch(API + "/Key/cleanup_delay_days?sheet=Settings", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH },
+    body: JSON.stringify({ data: { Value: String(val) } }),
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+}
+
 async function clearDeadline() {
   var res = await fetch(API + "/Key/deadline?sheet=Settings", {
     method: "PATCH",
@@ -2668,6 +2687,20 @@ async function loadDeadline() {
       if (rows2 && rows2.length) {
         var val2 = rows2[0]["Value"] !== undefined ? rows2[0]["Value"] : rows2[0]["value"];
         if (val2) testDate = new Date(val2);
+      }
+    }
+
+    // 3. Load Auto-Cleanup Delay (Days)
+    cleanupDelayDays = 2; // default
+    var res3 = await fetch(API + "/search?sheet=Settings&Key=cleanup_delay_days");
+    if (res3.ok) {
+      var rows3 = await res3.json();
+      if (rows3 && rows3.length) {
+        var val3 = rows3[0]["Value"] !== undefined ? rows3[0]["Value"] : rows3[0]["value"];
+        if (val3 !== undefined && val3 !== "") {
+          var num = parseInt(val3, 10);
+          if (!isNaN(num) && num >= 0) cleanupDelayDays = num;
+        }
       }
     }
   } catch (e) {
@@ -2974,8 +3007,8 @@ function renderAdminPanelHTML() {
 
           return (
             '<div class="session-row" style="padding:12px;justify-content:space-between;align-items:center">' +
-            '<div><div style="font-size:14px;font-weight:600;color:#fff;margin-bottom:4px">' +
-            esc(nm) + ' <span style="font-size:12px;color:var(--primary);font-weight:400">(ID: ' + esc(st.CandidateNumber || st.candidatenumber || "N/A") + ')</span>' +
+            '<div><div style="font-size:14px;font-weight:600;color:var(--text);margin-bottom:4px">' +
+            esc(nm) + ' <span style="font-size:12px;color:var(--accent);font-weight:400">(ID: ' + esc(st.CandidateNumber || st.candidatenumber || "N/A") + ')</span>' +
             "</div>" +
             '<div style="font-size:12px;color:var(--muted)">' +
             esc(ph) +
@@ -3021,7 +3054,7 @@ function renderAdminPanelHTML() {
 
     var testDateStr = testDate ? toLocalDateString(testDate) : "";
     var testDateDisplay = testDate
-      ? '<div class="deadline-display" style="margin-top:4px">Test Date (Bot Reminders): <strong>' + formatTestDate(testDate) + "</strong></div>"
+      ? '<div class="deadline-display" style="margin-top:4px">Test Date (Bot Reminders): <strong>' + formatTestDate(testDate) + '</strong> &bull; Auto-clear: <strong>' + cleanupDelayDays + ' days after</strong></div>'
       : '<div class="deadline-display" style="color:#888;margin-top:4px">No test date set for bot reminders.</div>';
 
     var allErrors = [deadlineLoadError, sessionConfigError].filter(Boolean).join(" | ");
@@ -3040,6 +3073,9 @@ function renderAdminPanelHTML() {
       
       '<div style="margin-top:12px"><label style="font-size:13px;font-weight:500;color:#555;display:block;margin-bottom:6px">Actual Test Date (For Bot Reminders & Cleanup)</label>' +
       '<input id="admin-testdate-input" class="admin-input" type="date" value="' + testDateStr + '" /></div>' +
+
+      '<div style="margin-top:12px"><label style="font-size:13px;font-weight:500;color:#555;display:block;margin-bottom:6px">Auto-Cleanup Delay (Days after test date)</label>' +
+      '<input id="admin-cleanup-days-input" class="admin-input" type="number" min="0" value="' + cleanupDelayDays + '" /></div>' +
       
       '<div id="admin-save-status" class="admin-status"></div>' +
       '<button class="btn-primary" style="margin-top:12px" onclick="adminSaveDates()">Save Settings</button>' +
@@ -3701,6 +3737,7 @@ async function adminSaveSessions() {
 async function adminSaveDates() {
   var inpD = document.getElementById("admin-deadline-input");
   var inpT = document.getElementById("admin-testdate-input");
+  var inpC = document.getElementById("admin-cleanup-days-input");
   var statusEl = document.getElementById("admin-save-status");
   
   var btn = document.querySelector(".admin-panel .btn-primary");
@@ -3724,9 +3761,18 @@ async function adminSaveDates() {
       await saveTestDate(isoStringT);
       testDate = new Date(isoStringT);
     }
+
+    // Save Cleanup Delay Days
+    if (inpC && inpC.value !== "") {
+      var valC = parseInt(inpC.value, 10);
+      if (!isNaN(valC) && valC >= 0) {
+        await saveCleanupDelayDays(valC);
+        cleanupDelayDays = valC;
+      }
+    }
     
     if (statusEl) {
-      statusEl.textContent = "Dates saved successfully!";
+      statusEl.textContent = "Dates & settings saved successfully!";
       statusEl.className = "admin-status ok";
     }
     setTimeout(function() { render(); }, 1200);
