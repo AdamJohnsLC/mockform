@@ -1,8 +1,7 @@
 // Cloudflare Worker — Google Apps Script proxy + static assets
 
 // Replace this URL once you deploy your Google Apps Script!
-const APP_SCRIPT_URL =
-  "https://script.google.com/macros/s/AKfycbxRzENke9rtXj2GPdZU7ztYEUlim3f8n0SB_7Nas1rJ4GVOwb-y-eq_Sko28OI2kc-v/exec";
+const APP_SCRIPT_URL="https://script.google.com/macros/s/AKfycbxRzENke9rtXj2GPdZU7ztYEUlim3f8n0SB_7Nas1rJ4GVOwb-y-eq_Sko28OI2kc-v/exec";
 
 const ALLOWED_PATH =
   /^(\/?|\/search|\/Slot\/[^/?]+|\/Phone\/[^/?]+|\/Key\/[^/?]+|\/admin\/.+)(\?.*)?$/;
@@ -1072,20 +1071,50 @@ async function botResults(db, token, chatId, env) {
     text: "🔍 Searching for your IELTS Mock exam results in Google Drive...",
   });
 
-  var targetUrl = env.RESULTS_UPLOAD_URL || "https://script.google.com/macros/s/AKfycbz5tmKzssmwyR6i3Z_JvlwbMfODVySTDoSWJopAep5IeWpr_FEfbfLgmwh9qspYEyF8qg/exec";
+  var targetUrl = env.RESULTS_UPLOAD_URL || "https://script.google.com/macros/s/AKfycbw-S0WLpMmJlxRwpK462yI009TIX3EaKHuo6J480ZiVA6sap1-UFzPbi1FB2wBJr_AzRA/exec";
   var filesSent = 0;
 
   for (var k = 0; k < matchedRegs.length; k++) {
     var reg = matchedRegs[k];
     var studentName = reg.Name || reg.name || "Student";
     var cn = reg.CandidateNumber || reg.candidatenumber || "";
-    if (!cn) continue;
+    if (!cn && !studentName) continue;
+
+    // DEBUG: show what we're searching for
+    await sendTelegram(token, "sendMessage", {
+      chat_id: chatId,
+      text: "🔧 DEBUG: Searching for CN=\"" + cn + "\", Name=\"" + studentName + "\"\nURL: " + targetUrl.slice(-30) + "..."
+    });
 
     try {
-      var searchResp = await fetch(targetUrl + "?action=search&candidateNumber=" + encodeURIComponent(cn));
-      if (searchResp.ok) {
-        var searchResult = await searchResp.json();
+      var searchUrl = targetUrl + "?action=search&candidateNumber=" + encodeURIComponent(cn) + "&studentName=" + encodeURIComponent(studentName);
+      var searchResp = await fetch(searchUrl);
+
+      // DEBUG: show raw response status
+      var rawSearchText = await searchResp.text();
+      await sendTelegram(token, "sendMessage", {
+        chat_id: chatId,
+        text: "🔧 DEBUG: GAS search response status=" + searchResp.status + ", body (first 500 chars):\n" + rawSearchText.slice(0, 500)
+      });
+
+      if (searchResp.ok || searchResp.status === 200) {
+        var searchResult;
+        try {
+          searchResult = JSON.parse(rawSearchText);
+        } catch (parseErr) {
+          await sendTelegram(token, "sendMessage", {
+            chat_id: chatId,
+            text: "🔧 DEBUG: Failed to parse JSON: " + parseErr.message
+          });
+          continue;
+        }
+
         if (searchResult && searchResult.ok && Array.isArray(searchResult.files) && searchResult.files.length > 0) {
+          await sendTelegram(token, "sendMessage", {
+            chat_id: chatId,
+            text: "🔧 DEBUG: Found " + searchResult.files.length + " file(s): " + searchResult.files.map(function(f) { return f.name; }).join(", ")
+          });
+
           for (var f = 0; f < searchResult.files.length; f++) {
             var fileInfo = searchResult.files[f];
             var fileResp = await fetch(targetUrl + "?action=getFile&fileId=" + fileInfo.id);
@@ -1099,17 +1128,40 @@ async function botResults(db, token, chatId, env) {
                 formData.append("document", htmlBlob, fileData.name || (studentName.replace(/\s+/g, "_") + "_results.html"));
                 formData.append("caption", "📊 IELTS Mock Exam Results for " + studentName);
 
-                await fetch("https://api.telegram.org/bot" + token + "/sendDocument", {
+                var sendDocResp = await fetch("https://api.telegram.org/bot" + token + "/sendDocument", {
                   method: "POST",
                   body: formData
                 });
+                await sendTelegram(token, "sendMessage", {
+                  chat_id: chatId,
+                  text: "🔧 DEBUG: sendDocument status=" + sendDocResp.status
+                });
                 filesSent++;
+              } else {
+                await sendTelegram(token, "sendMessage", {
+                  chat_id: chatId,
+                  text: "🔧 DEBUG: getFile response missing html. ok=" + (fileData && fileData.ok) + ", hasHtml=" + !!(fileData && fileData.html)
+                });
               }
+            } else {
+              await sendTelegram(token, "sendMessage", {
+                chat_id: chatId,
+                text: "🔧 DEBUG: getFile failed, status=" + fileResp.status
+              });
             }
           }
+        } else {
+          await sendTelegram(token, "sendMessage", {
+            chat_id: chatId,
+            text: "🔧 DEBUG: searchResult.ok=" + (searchResult && searchResult.ok) + ", files=" + JSON.stringify(searchResult && searchResult.files)
+          });
         }
       }
     } catch (e) {
+      await sendTelegram(token, "sendMessage", {
+        chat_id: chatId,
+        text: "🔧 DEBUG: Exception: " + String(e && e.message || e)
+      });
       console.error("Results fetch error for " + studentName + " (ID: " + cn + ")", e);
     }
   }
