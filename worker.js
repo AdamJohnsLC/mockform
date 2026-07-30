@@ -317,9 +317,15 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
     if (method === "GET") {
       // If a search query is provided (e.g. ?Phone=...), filter
       if (subPath === "/search" || subPath.startsWith("/search")) {
+        const searchPhone = qsParams.Phone || qsParams.phone;
+        const cleanSearchPhone = searchPhone ? String(searchPhone).replace(/\D/g, "").slice(-9) : null;
         const filtered = rows.map(correctRegistration).filter((r) => {
+          if (cleanSearchPhone) {
+            const rPhone = String(r.Phone || r.phone || "").replace(/\D/g, "").slice(-9);
+            if (rPhone !== cleanSearchPhone) return false;
+          }
           for (const key in qsParams) {
-            if (key === "sheet") continue;
+            if (key === "sheet" || key === "Phone" || key === "phone") continue;
             if (String(r[key]) !== String(qsParams[key])) return false;
           }
           return true;
@@ -638,18 +644,18 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
   // READ OPERATIONS (GET)
   if (method === "GET") {
     if (sheet === "Seats") {
+      let authSeats = await computeAuthoritativeSeats(db);
       if (subPath.startsWith("/search")) {
         let sid = qsParams.Slot;
-        if (sid && dataObj[sid] !== undefined) {
-          return new Response(
-            JSON.stringify([{ Slot: sid, Remaining: dataObj[sid] }]),
-            { status: 200, headers: corsHeaders },
-          );
-        }
+        let val = authSeats[sid] !== undefined ? authSeats[sid] : (sid && sid.startsWith("speak_") ? 1 : 0);
+        return new Response(
+          JSON.stringify([{ Slot: sid, Remaining: val }]),
+          { status: 200, headers: corsHeaders },
+        );
       } else {
-        let arr = Object.keys(dataObj).map((k) => ({
+        let arr = Object.keys(authSeats).map((k) => ({
           Slot: k,
-          Remaining: dataObj[k],
+          Remaining: authSeats[k],
         }));
         return new Response(JSON.stringify(arr), {
           status: 200,
@@ -2608,4 +2614,62 @@ async function handleChangeSpeakingSlot(request, env, parsedBody, ctx) {
     JSON.stringify({ ok: true, speakingTime: newTime }),
     { status: 200, headers: corsHeaders }
   );
+}
+
+async function computeAuthoritativeSeats(db) {
+  let settings = (await db.get("Settings", "json")) || {};
+  let cfgRaw = settings.session_config;
+  let sessions = [];
+  if (cfgRaw) {
+    try {
+      sessions = typeof cfgRaw === "string" ? JSON.parse(cfgRaw) : cfgRaw;
+    } catch (e) {}
+  }
+  let regs = (await db.get("Registrations", "json")) || [];
+  if (!Array.isArray(regs)) regs = [];
+
+  let seatsMap = {};
+  const teachers = (Array.isArray(sessions) && sessions.length > 0) ? (Number(sessions[0].teachers) || 1) : 1;
+
+  if (Array.isArray(sessions) && sessions.length > 0) {
+    sessions.forEach((s) => {
+      const label = String(s.label || "").trim();
+      const max = Number(s.mainSeats) || Number(s.maxSeats) || 10;
+      const taken = regs.reduce((n, r) => {
+        const rSess = String(r.Session || r.session || "").replace(/ \(est\.\)$/, "").trim();
+        return rSess === label ? n + 1 : n;
+      }, 0);
+      seatsMap[s.id] = Math.max(0, max - taken);
+    });
+  }
+
+  let rawKV = (await db.get("Seats", "json")) || {};
+  Object.keys(rawKV).forEach((k) => {
+    if (k.startsWith("speak_")) {
+      const hhmm = k.substring(6, 8) + ":" + k.substring(8, 10);
+      const held = regs.filter((x) => {
+        const xSpk = String(x.SpeakingTime || x.speakingtime || "").replace(/ \(est\.\)$/, "").trim();
+        return xSpk === hhmm;
+      }).length;
+      seatsMap[k] = Math.max(0, teachers - held);
+    } else if (seatsMap[k] === undefined) {
+      seatsMap[k] = rawKV[k];
+    }
+  });
+
+  regs.forEach((r) => {
+    const spk = String(r.SpeakingTime || r.speakingtime || "").replace(/ \(est\.\)$/, "").trim();
+    if (spk && /^\d{1,2}:\d{2}$/.test(spk)) {
+      const poolId = "speak_" + spk.replace(":", "");
+      if (seatsMap[poolId] === undefined) {
+        const held = regs.filter((x) => {
+          const xSpk = String(x.SpeakingTime || x.speakingtime || "").replace(/ \(est\.\)$/, "").trim();
+          return xSpk === spk;
+        }).length;
+        seatsMap[poolId] = Math.max(0, teachers - held);
+      }
+    }
+  });
+
+  return seatsMap;
 }

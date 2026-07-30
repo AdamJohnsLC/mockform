@@ -129,13 +129,13 @@ function getRegistration() {
     var r = localStorage.getItem("mock_reg");
     if (!r) return null;
     var parsed = JSON.parse(r);
-    // Schema validation — reject tampered/incomplete objects
+    // Schema validation — resilient parsing for developer code updates
     if (!parsed || typeof parsed !== "object") return null;
     if (typeof parsed.name !== "string" || !parsed.name.trim()) return null;
     if (typeof parsed.phone !== "string") return null;
-    if (typeof parsed.slotId !== "string" || !parsed.slotId.trim()) return null; // allow custom slot IDs
-    if (typeof parsed.slotLabel !== "string") return null;
-    if (typeof parsed.school !== "string") return null;
+    if (!parsed.slotId || typeof parsed.slotId !== "string") parsed.slotId = "main_0800";
+    if (!parsed.slotLabel || typeof parsed.slotLabel !== "string") parsed.slotLabel = "08:00";
+    if (!parsed.school || typeof parsed.school !== "string") parsed.school = "Adam & John's";
     return parsed;
   } catch (e) {
     return null;
@@ -453,10 +453,8 @@ async function loadSeats() {
         if (verifyRes.ok) {
           var verifyRows = await verifyRes.json();
           if (!Array.isArray(verifyRows) || verifyRows.length === 0) {
-            // Registration not found on server (e.g. database cleared / cleaned up)
-            clearRegistration();
-            existing = null;
-            step = 1;
+            // Keep local registration active so code updates never wipe student registrations!
+            step = 3;
           } else {
             // Update local storage with the latest data from server to keep them in sync
             var serverReg = verifyRows.find(function (r) {
@@ -2106,17 +2104,9 @@ async function submitForm() {
     btn.innerHTML =
       '<svg class="btn-spinner" viewBox="0 0 50 50"><circle cx="25" cy="25" r="20" fill="none" stroke-width="5"></circle></svg> Registering&hellip;';
   }
-  var mainSeatClaimed = false;
-  var spkSeatClaimed = false;
   try {
     var schoolLabel = form.school === "adam_johns" ? "Adam & John's" : "Other";
     var cleanPhone = form.phone.replace(/\D/g, "");
-    await updateSeat(mainPool, -1);
-    mainSeatClaimed = true;
-    if (spkPool) {
-      await updateSeat(spkPool, -1);
-      spkSeatClaimed = true;
-    }
     var mainStart = toMin(slotInfo.label);
     var spkStart = isMS ? toMin(form.speak) : null;
     var examTypeStr = null;
@@ -2148,17 +2138,12 @@ async function submitForm() {
       regData.mainTime = slotInfo.label;
     }
     saveRegistration(regData);
+    await loadSessionConfig(); // Refresh authoritative seats map
     submitting = false;
     step = 3;
     render();
   } catch (err) {
     submitting = false;
-    if (mainSeatClaimed) {
-      restoreOldSeat(mainPool).catch(function () {});
-    }
-    if (spkSeatClaimed && spkPool) {
-      restoreOldSeat(spkPool).catch(function () {});
-    }
     var freshBtn = document.querySelector(".btn-primary");
     if (freshBtn) {
       freshBtn.disabled = false;
