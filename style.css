@@ -259,6 +259,27 @@ body::before {
       text-transform: uppercase;
       transition: all 0.3s ease;
     }
+    .session-type-badge {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      transition: all 0.3s ease;
+    }
+    .session-type-badge.speaking {
+      background: rgba(124, 58, 237, 0.12);
+      color: #7c3aed;
+      border: 1px solid rgba(124, 58, 237, 0.25);
+    }
+    .session-type-badge.lr-only {
+      background: rgba(14, 165, 233, 0.12);
+      color: #0284c7;
+      border: 1px solid rgba(14, 165, 233, 0.25);
+    }
     .time-card-badge.urgent {
       background: var(--speak-dim);
       color: var(--speak);

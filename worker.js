@@ -118,7 +118,8 @@ async function handleApi(request, env, url, ctx) {
   if (
     qsParams.sheet === "Seats" ||
     qsParams.sheet === "Settings" ||
-    qsParams.sheet === "Registrations"
+    qsParams.sheet === "Registrations" ||
+    qsParams.sheet === "Results"
   ) {
     try {
       return await handleKV(request, env, subPath, qsParams, parsedBody, ctx);
@@ -537,6 +538,94 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
   }
 
   // ==========================================================
+  // RESULTS — stored as a JSON Array in KV & Google Sheets
+  // ==========================================================
+  if (sheet === "Results") {
+    let resultsList = await db.get("Results", "json");
+    if (!Array.isArray(resultsList)) resultsList = [];
+
+    if (method === "GET") {
+      // Pull latest teacher edits directly from Google Sheets "Results" tab if configured
+      if (targetUrl && !targetUrl.includes("PASTE_YOUR_WEB")) {
+        try {
+          const gasResp = await fetch(targetUrl, {
+            method: "POST",
+            body: JSON.stringify({ method: "GET", sheet: "Results", path: subPath }),
+            headers: { "Content-Type": "text/plain" }
+          });
+          if (gasResp.ok) {
+            const freshData = await gasResp.json();
+            if (Array.isArray(freshData) && freshData.length > 0) {
+              resultsList = freshData;
+              await db.put("Results", JSON.stringify(resultsList));
+            }
+          }
+        } catch (gasErr) {
+          console.warn("GAS fetch for Results sheet fallback:", gasErr);
+        }
+      }
+
+      if (subPath === "/search" || subPath.startsWith("/search")) {
+        const filtered = resultsList.filter((r) => {
+          for (const key in qsParams) {
+            if (key === "sheet") continue;
+            if (String(r[key] || "").toLowerCase() !== String(qsParams[key] || "").toLowerCase()) return false;
+          }
+          return true;
+        });
+        return new Response(JSON.stringify(filtered), {
+          status: 200,
+          headers: corsHeaders,
+        });
+      }
+      return new Response(JSON.stringify(resultsList), {
+        status: 200,
+        headers: corsHeaders,
+      });
+    }
+
+    if (method === "POST" && payload) {
+      const cn = String(payload.CandidateNumber || "").trim();
+      const existingIdx = cn ? resultsList.findIndex(r => String(r.CandidateNumber || "").trim() === cn) : -1;
+      
+      const record = {
+        CandidateNumber: cn || "000000",
+        Name: payload.Name || "Candidate",
+        ListeningBandScore: payload.ListeningBandScore || "N/A",
+        ReadingBandScore: payload.ReadingBandScore || "N/A",
+        LRAverageBandScore: payload.LRAverageBandScore || "N/A",
+        WritingBandScore: payload.WritingBandScore || "Pending Evaluation",
+        SpeakingBandScore: payload.SpeakingBandScore || "Pending Evaluation",
+        OverallBandScore: payload.OverallBandScore || "Pending",
+        TestID: payload.TestID || "Mock_Exam",
+        Timestamp: payload.Timestamp || new Date().toISOString()
+      };
+
+      if (existingIdx >= 0) {
+        resultsList[existingIdx] = Object.assign({}, resultsList[existingIdx], record);
+      } else {
+        resultsList.push(record);
+      }
+
+      await db.put("Results", JSON.stringify(resultsList));
+      bgSync(); // Sync to Google Sheets "Results" sheet!
+
+      return new Response(JSON.stringify({ ok: true, record }), {
+        status: 200,
+        headers: corsHeaders,
+      });
+    }
+
+    if (method === "DELETE") {
+      await db.put("Results", JSON.stringify([]));
+      return new Response(JSON.stringify({ ok: true, cleared: true }), {
+        status: 200,
+        headers: corsHeaders,
+      });
+    }
+  }
+
+  // ==========================================================
   // SEATS & SETTINGS — stored as a JSON Object in KV
   // ==========================================================
   let dataObj = await db.get(sheet, "json");
@@ -687,6 +776,14 @@ async function handleBotAsync(update, env) {
     }
     else if (text === "/candidate" || text.includes("Candidate Number")) {
       await botCandidateNumber(db, token, chatId);
+    }
+    else if (/^\d{6}$/.test(text) || (text.toLowerCase().startsWith("/results") && text.length > 8)) {
+      var candidateNum = text.replace(/\D/g, "");
+      if (candidateNum.length === 6) {
+        await botResultsByCandidateNumber(db, token, chatId, env, candidateNum);
+      } else {
+        await botResults(db, token, chatId, env);
+      }
     }
     else if (text === "/results" || text.includes("My Results") || text.includes("Get Results")) {
       await botResults(db, token, chatId, env);
@@ -1019,10 +1116,14 @@ async function botCandidateNumber(db, token, chatId) {
   });
 }
 
-// /results — search and retrieve IELTS results HTML from Google Drive
+// /results — search and retrieve IELTS results HTML & Band Scores
 async function botResults(db, token, chatId, env) {
-  var users = await db.get("TelegramUsers", "json");
-  if (!users || typeof users !== "object") users = {};
+  var users = await db.get("TelegramUsers", "json") || {};
+  var candMap = await db.get("TelegramCandidateNumbers", "json") || {};
+
+  // Check saved candidate numbers for this chatId
+  var savedCNs = candMap[chatId] || [];
+  if (!Array.isArray(savedCNs)) savedCNs = [savedCNs];
 
   // Reverse-lookup: find ALL phone numbers linked to this chatId
   var matchedPhones = [];
@@ -1033,93 +1134,162 @@ async function botResults(db, token, chatId, env) {
     }
   }
 
-  if (matchedPhones.length === 0) {
-    await sendTelegram(token, "sendMessage", {
-      chat_id: chatId,
-      text:
-        "You haven't linked your registration yet.\n\n" +
-        'Register at the mock test website and click the "Get Telegram Reminders" link on your success page.',
-    });
-    return;
-  }
-
   var regs = await db.get("Registrations", "json");
   if (!Array.isArray(regs)) regs = [];
   regs = regs.map(correctRegistration);
 
-  var matchedRegs = [];
+  var candidateNumbersToSearch = new Set(savedCNs);
   for (var j = 0; j < regs.length; j++) {
     var rp = String(regs[j].Phone || regs[j].phone || "").replace(/\D/g, "").slice(-9);
     if (matchedPhones.includes(rp)) {
-      matchedRegs.push(regs[j]);
+      var cn = regs[j].CandidateNumber || regs[j].candidatenumber;
+      if (cn) candidateNumbersToSearch.add(String(cn).trim());
     }
   }
 
-  if (matchedRegs.length === 0) {
+  // Also check KV Results store for candidate numbers matching this chatId
+  var resultsList = await db.get("Results", "json") || [];
+  for (var r of resultsList) {
+    if (r.ChatId === chatId && r.CandidateNumber) {
+      candidateNumbersToSearch.add(String(r.CandidateNumber).trim());
+    }
+  }
+
+  if (candidateNumbersToSearch.size === 0) {
+    // Database cleared or no active link: prompt user for their Candidate Number!
     await sendTelegram(token, "sendMessage", {
       chat_id: chatId,
       text:
-        "⚠️ Your phone is linked but no active registration was found.\n" +
-        "Your registration may have been cancelled or cleared.",
+        "📊 <b>Retrieve Your IELTS Mock Test Results</b>\n\n" +
+        "No active registration link found for this chat (or database test records were cleared).\n\n" +
+        "<b>To get your results:</b>\n" +
+        "Please reply with your <b>6-digit Candidate Number</b> (e.g. <code>847291</code>).\n\n" +
+        "<i>You can find your Candidate Number on your registration receipt or mock test desk label.</i>",
+      parse_mode: "HTML",
+      reply_markup: getReplyKeyboard()
     });
     return;
   }
 
-  // Notify user that search is in progress
+  var cnsArray = Array.from(candidateNumbersToSearch);
+  for (var c = 0; c < cnsArray.length; c++) {
+    await botResultsByCandidateNumber(db, token, chatId, env, cnsArray[c]);
+  }
+}
+
+// Search and return result by Candidate Number
+async function botResultsByCandidateNumber(db, token, chatId, env, cn) {
+  cn = String(cn).trim();
+  if (!cn) return;
+
+  // Store candidate number mapping for this chatId in TelegramCandidateNumbers
+  try {
+    var candMap = await db.get("TelegramCandidateNumbers", "json") || {};
+    if (!Array.isArray(candMap[chatId])) candMap[chatId] = [];
+    if (!candMap[chatId].includes(cn)) {
+      candMap[chatId].push(cn);
+      await db.put("TelegramCandidateNumbers", JSON.stringify(candMap));
+    }
+  } catch (e) {}
+
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
-    text: "🔍 Searching for your IELTS Mock exam results in Google Drive...",
+    text: "🔍 Searching for IELTS Mock results for Candidate Number <code>" + escHtml(cn) + "</code>...",
+    parse_mode: "HTML"
   });
 
+  var foundAny = false;
+
+  // 1. Search KV Results Sheet for instant band score summary
+  try {
+    var resultsList = await db.get("Results", "json") || [];
+    var matchedResult = resultsList.find(r => String(r.CandidateNumber || "").trim() === cn);
+
+    if (matchedResult) {
+      foundAny = true;
+      var name = matchedResult.Name || "Candidate";
+      var lScore = matchedResult.ListeningBandScore || "N/A";
+      var rScore = matchedResult.ReadingBandScore || "N/A";
+      var wScore = matchedResult.WritingBandScore || "Pending Evaluation";
+      var sScore = matchedResult.SpeakingBandScore || "Pending Evaluation";
+      var overallScore = matchedResult.OverallBandScore || "Pending";
+      var lrAvg = matchedResult.LRAverageBandScore || lScore;
+
+      var isLR = matchedResult.HasSpeaking === false || sScore === "N/A" || sScore === "Not Included";
+
+      var scoreMsg = "";
+      if (isLR) {
+        scoreMsg = "📊 <b>IELTS Mock Exam Results (L&R)</b>\n\n" +
+          "👤 <b>Candidate:</b> " + escHtml(name) + "\n" +
+          "🆔 <b>Candidate No:</b> <code>" + escHtml(cn) + "</code>\n\n" +
+          "🎧 <b>Listening Band:</b> " + escHtml(lScore) + "\n" +
+          "📖 <b>Reading Band:</b> " + escHtml(rScore) + "\n" +
+          "🎯 <b>L&R Average Band:</b> " + escHtml(lrAvg) + "\n";
+      } else {
+        scoreMsg = "📊 <b>Official IELTS Mock Exam Results</b>\n\n" +
+          "👤 <b>Candidate:</b> " + escHtml(name) + "\n" +
+          "🆔 <b>Candidate No:</b> <code>" + escHtml(cn) + "</code>\n\n" +
+          "🎧 <b>Listening Band:</b> " + escHtml(lScore) + "\n" +
+          "📖 <b>Reading Band:</b> " + escHtml(rScore) + "\n" +
+          "✍️ <b>Writing Band:</b> " + escHtml(wScore) + "\n" +
+          "🗣️ <b>Speaking Band:</b> " + escHtml(sScore) + "\n" +
+          "⭐ <b>Overall Band Score:</b> <b>" + escHtml(overallScore) + "</b>\n";
+      }
+
+      await sendTelegram(token, "sendMessage", {
+        chat_id: chatId,
+        text: scoreMsg.trim(),
+        parse_mode: "HTML",
+        reply_markup: getReplyKeyboard()
+      });
+    }
+  } catch (err) {
+    console.error("Error searching Results KV for candidate " + cn, err);
+  }
+
+  // 2. Search Google Drive for full HTML result document
   var targetUrl = env.RESULTS_UPLOAD_URL || "https://script.google.com/macros/s/AKfycbx_2KtfAOmA59QRSaXMFRkq0aa4ovsrjBPLcvFCX8JZSoVHC-oVf0i3dU6ju10KUaxS2w/exec";
-  var filesSent = 0;
+  try {
+    var searchUrl = targetUrl + "?action=search&candidateNumber=" + encodeURIComponent(cn);
+    var searchResp = await fetch(searchUrl);
 
-  for (var k = 0; k < matchedRegs.length; k++) {
-    var reg = matchedRegs[k];
-    var studentName = reg.Name || reg.name || "Student";
-    var cn = reg.CandidateNumber || reg.candidatenumber || "";
-    if (!cn && !studentName) continue;
+    if (searchResp.ok || searchResp.status === 200) {
+      var searchResult = await searchResp.json();
 
-    try {
-      var searchUrl = targetUrl + "?action=search&candidateNumber=" + encodeURIComponent(cn) + "&studentName=" + encodeURIComponent(studentName);
-      var searchResp = await fetch(searchUrl);
+      if (searchResult && searchResult.ok && Array.isArray(searchResult.files) && searchResult.files.length > 0) {
+        for (var f = 0; f < searchResult.files.length; f++) {
+          var fileInfo = searchResult.files[f];
+          var fileResp = await fetch(targetUrl + "?action=getFile&fileId=" + fileInfo.id);
+          if (fileResp.ok) {
+            var fileData = await fileResp.json();
+            if (fileData && fileData.ok && fileData.html) {
+              const formData = new FormData();
+              formData.append("chat_id", chatId);
+              const htmlBlob = new Blob([fileData.html], { type: "text/html" });
+              formData.append("document", htmlBlob, fileData.name || ("IELTS_Result_" + cn + ".html"));
+              formData.append("caption", "📄 Official IELTS Result Document (Candidate #" + cn + ")");
 
-      if (searchResp.ok || searchResp.status === 200) {
-        var searchResult = await searchResp.json();
-
-        if (searchResult && searchResult.ok && Array.isArray(searchResult.files) && searchResult.files.length > 0) {
-          for (var f = 0; f < searchResult.files.length; f++) {
-            var fileInfo = searchResult.files[f];
-            var fileResp = await fetch(targetUrl + "?action=getFile&fileId=" + fileInfo.id);
-            if (fileResp.ok) {
-              var fileData = await fileResp.json();
-              if (fileData && fileData.ok && fileData.html) {
-                const formData = new FormData();
-                formData.append("chat_id", chatId);
-                const htmlBlob = new Blob([fileData.html], { type: "text/html" });
-                formData.append("document", htmlBlob, fileData.name || (studentName.replace(/\s+/g, "_") + "_results.html"));
-                formData.append("caption", "📊 IELTS Mock Exam Results for " + studentName);
-
-                await fetch("https://api.telegram.org/bot" + token + "/sendDocument", {
-                  method: "POST",
-                  body: formData
-                });
-                filesSent++;
-              }
+              await fetch("https://api.telegram.org/bot" + token + "/sendDocument", {
+                method: "POST",
+                body: formData
+              });
+              foundAny = true;
             }
           }
         }
       }
-    } catch (e) {
-      console.error("Results fetch error for " + studentName + " (ID: " + cn + ")", e);
     }
+  } catch (e) {
+    console.error("Google Drive fetch error for Candidate ID " + cn, e);
   }
 
-  if (filesSent === 0) {
+  if (!foundAny) {
     await sendTelegram(token, "sendMessage", {
       chat_id: chatId,
-      text: "📭 No results found for your registration(s) yet.\n\n" +
-            "Please make sure you entered the correct Candidate Number in your IELTS Simulator test and completed the examination.",
+      text: "📭 No test document found yet for Candidate Number <code>" + escHtml(cn) + "</code>.\n\n" +
+            "Please verify your Candidate Number or check back after your test results have been processed and uploaded by your examiner.",
+      parse_mode: "HTML",
+      reply_markup: getReplyKeyboard()
     });
   }
 }
@@ -1572,6 +1742,118 @@ async function handleAdminRoute(request, env, url, subPath, qsParams, ctx) {
     try {
       body = await request.clone().json();
     } catch (e) {}
+  }
+
+  // POST /api/admin/send-results-notifications — broadcast evaluated band scores directly from Google Sheets / Results sheet to candidates
+  if (subPath === "/admin/send-results-notifications" && method === "POST") {
+    const targetUrl = env.GAS_URL || APP_SCRIPT_URL;
+    let resultsList = await db.get("Results", "json") || [];
+
+    // 1. Fetch fresh evaluated scores directly from Google Sheets "Results" sheet
+    if (targetUrl && !targetUrl.includes("PASTE_YOUR_WEB")) {
+      try {
+        const gasResp = await fetch(targetUrl, {
+          method: "POST",
+          body: JSON.stringify({ method: "GET", sheet: "Results", path: "" }),
+          headers: { "Content-Type": "text/plain" }
+        });
+        if (gasResp.ok) {
+          const freshData = await gasResp.json();
+          if (Array.isArray(freshData) && freshData.length > 0) {
+            resultsList = freshData;
+            await db.put("Results", JSON.stringify(resultsList));
+          }
+        }
+      } catch (gasErr) {
+        console.warn("GAS fetch for Results sheet fallback:", gasErr);
+      }
+    }
+
+    const usersMap = await db.get("TelegramUsers", "json") || {};
+    const candMap = await db.get("TelegramCandidateNumbers", "json") || {};
+    const regsList = await db.get("Registrations", "json") || [];
+
+    let sentCount = 0;
+    let totalProcessed = 0;
+
+    function isUnscored(val) {
+      if (val == null) return true;
+      const s = String(val).trim().toLowerCase();
+      return s === "" || s === "-" || s === "n/a" || s === "not included" || s === "none" || s === "pending evaluation" || s === "pending";
+    }
+
+    for (const r of resultsList) {
+      totalProcessed++;
+      const cn = String(r.CandidateNumber || r.candidateNumber || r.candidate_number || "").trim();
+      const name = r.Name || r.name || r.student_name || "Candidate";
+      if (!cn) continue;
+
+      let targetChatId = null;
+
+      // Match by candidate number in TelegramCandidateNumbers
+      for (const cid in candMap) {
+        const cns = Array.isArray(candMap[cid]) ? candMap[cid] : [candMap[cid]];
+        if (cns.includes(cn)) {
+          targetChatId = cid;
+          break;
+        }
+      }
+
+      // Match by Registration phone number -> TelegramUsers[phone]
+      if (!targetChatId && Array.isArray(regsList)) {
+        const reg = regsList.find(rg => String(rg.CandidateNumber || rg.candidatenumber || "").trim() === cn);
+        if (reg && reg.Phone) {
+          const cleanPhone = String(reg.Phone).replace(/\D/g, "").slice(-9);
+          targetChatId = usersMap[cleanPhone];
+        }
+      }
+
+      if (targetChatId && token) {
+        const lBand = r.ListeningBandScore || r.listening || r.Listening || "N/A";
+        const rBand = r.ReadingBandScore || r.reading || r.Reading || "N/A";
+        const wBand = r.WritingBandScore || r.writing || r.Writing || "-";
+        const sBand = r.SpeakingBandScore || r.speaking || r.Speaking || "-";
+        const overallBand = r.OverallBandScore || r.overall || r.Overall || "-";
+        const lrAvgBand = r.LRAverageBandScore || r.lrAverage || lBand;
+
+        const isLR = isUnscored(wBand) && isUnscored(sBand);
+        let msg = "";
+
+        if (isLR) {
+          msg = "📊 <b>IELTS Mock Exam Results (Listening & Reading)</b>\n\n" +
+            "👤 <b>Candidate:</b> " + escHtml(name) + "\n" +
+            "🆔 <b>Candidate No:</b> <code>" + escHtml(cn) + "</code>\n\n" +
+            "🎧 <b>Listening Band:</b> " + escHtml(lBand) + "\n" +
+            "📖 <b>Reading Band:</b> " + escHtml(rBand) + "\n" +
+            "🎯 <b>L&R Average Band:</b> " + escHtml(lrAvgBand) + "\n\n" +
+            "<i>Great effort on your exam!</i>";
+        } else {
+          msg = "📊 <b>Official IELTS Mock Exam Final Results</b>\n\n" +
+            "👤 <b>Candidate:</b> " + escHtml(name) + "\n" +
+            "🆔 <b>Candidate No:</b> <code>" + escHtml(cn) + "</code>\n\n" +
+            "🎧 <b>Listening Band:</b> " + escHtml(lBand) + "\n" +
+            "📖 <b>Reading Band:</b> " + escHtml(rBand) + "\n" +
+            "✍️ <b>Writing Band:</b> " + escHtml(wBand) + "\n" +
+            "🗣️ <b>Speaking Band:</b> " + escHtml(sBand) + "\n" +
+            "⭐ <b>Overall Band Score:</b> <b>" + escHtml(overallBand) + "</b>\n\n" +
+            "<i>Congratulations on completing your mock test!</i>";
+        }
+
+        try {
+          await sendTelegram(token, "sendMessage", {
+            chat_id: targetChatId,
+            text: msg,
+            parse_mode: "HTML",
+            reply_markup: getReplyKeyboard()
+          });
+          sentCount++;
+        } catch (err) {
+          console.error("Failed to send result notification to candidate " + cn, err);
+        }
+      }
+    }
+
+    return jsonResp({ ok: true, sentCount, totalProcessed }, 200);
   }
 
   // GET /api/admin/bot-stats

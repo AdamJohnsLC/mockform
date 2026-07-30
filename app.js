@@ -913,6 +913,12 @@ function renderStep1() {
     // Doors open time (15 mins before label)
     var doorsTimeStr = getDoorsOpenTime(s.label);
     
+    // Session exam type badge
+    var hasSpeaking = s.speakingEnabled !== false && Number(s.teachers) > 0;
+    var typeBadgeClass = hasSpeaking ? "session-type-badge speaking" : "session-type-badge lr-only";
+    var typeBadgeText = hasSpeaking ? "🗣️ Main + Speaking" : "🎧 Listening & Reading Only";
+    var typeDescText = hasSpeaking ? "Includes 15-min Speaking Interview" : "Listening & Reading Modules (No Speaking)";
+
     // Badge styling and text
     var badgeClass = "time-card-badge";
     var badgeText = s.period;
@@ -925,6 +931,7 @@ function renderStep1() {
     }
     
     var badgeHtml = '<span class="' + badgeClass + '">' + badgeText + '</span>';
+    var typeBadgeHtml = '<span class="' + typeBadgeClass + '">' + typeBadgeText + '</span>';
     
     // Count html text
     var countHtml = isFull 
@@ -946,11 +953,12 @@ function renderStep1() {
       '<div class="' + cls + '" ' + onclick + '>' +
       '<span class="time-card-radio"></span>' +
       '<div class="time-card-content">' +
-      '<div class="time-card-title-row">' +
+      '<div class="time-card-title-row" style="gap:6px;flex-wrap:wrap;align-items:center">' +
       '<div class="time-label">' + s.label + '</div>' +
+      typeBadgeHtml +
       badgeHtml +
       '</div>' +
-      '<div class="time-card-period">' + doorsTimeStr + '</div>' +
+      '<div class="time-card-period">' + doorsTimeStr + ' &bull; ' + typeDescText + '</div>' +
       '</div>' +
       '<div class="time-card-meter">' +
       '<div class="time-card-count">' + countHtml + '</div>' +
@@ -998,21 +1006,23 @@ function renderSpeakingGrid() {
   var mainStart = toMin(si.label);
   var mainEnd = mainStart + mDur;
 
-  var cells = grid.map(function (g) {
+  // Filter OUT unchoosable cells that overlap the candidate's main exam time
+  var choosableGrid = grid.filter(function (g) {
+    return g.blockedByMain.indexOf(si.id) === -1;
+  });
+
+  var cells = choosableGrid.map(function (g) {
     var rem = seats[g.poolId] !== undefined ? Number(seats[g.poolId]) : g.capacity;
-    var blocksMe = g.blockedByMain.indexOf(si.id) !== -1;
     var isFull = rem <= 0;
     var isSelected = form.speak === g.label;
-    var disabled = blocksMe || isFull || g.capacity <= 0;
+    var disabled = isFull || g.capacity <= 0;
     var reason = "";
-    if (blocksMe) reason = "During your main exam";
-    else if (isFull) reason = "Full";
+    if (isFull) reason = "Full";
     else if (g.capacity <= 0) reason = "No teachers";
 
     var cls = ["speak-cell"];
     if (disabled) cls.push("disabled");
     if (isSelected) cls.push("selected");
-    if (blocksMe) cls.push("blocked");
     if (isFull) cls.push("full");
 
     var onclick = disabled ? "" : "onclick=\"selectSpeak('" + g.label + "')\"";
@@ -2942,12 +2952,19 @@ function renderAdminPanelHTML() {
     (adminActiveTab === "students" ? " active" : "") +
     '" onclick="adminSwitchTab(\'students\')">Students' + studentsBadge + '</button>' +
     '<button class="admin-tab' +
+    (adminActiveTab === "results" ? " active" : "") +
+    '" onclick="adminSwitchTab(\'results\')">Results</button>' +
+    '<button class="admin-tab' +
     (adminActiveTab === "bot" ? " active" : "") +
     '" onclick="adminSwitchTab(\'bot\')">Bot</button>' +
     "</div>";
 
   if (adminActiveTab === "bot") {
     return renderBotTabHTML(tabs);
+  }
+
+  if (adminActiveTab === "results") {
+    return renderResultsTabHTML(tabs);
   }
 
   if (adminActiveTab === "students") {
@@ -3376,6 +3393,104 @@ function renderAdminFeasibility(draft, dc) {
   );
 }
 
+var adminResultsList = null;
+var adminResultsLoading = false;
+var adminResultsStatus = "";
+
+async function adminLoadResults() {
+  adminResultsLoading = true;
+  render();
+  try {
+    var res = await fetch("/api?sheet=Results");
+    if (res.ok) {
+      adminResultsList = await res.json();
+    } else {
+      adminResultsList = [];
+    }
+  } catch (e) {
+    adminResultsList = [];
+  }
+  adminResultsLoading = false;
+  render();
+}
+
+async function adminSendResultsNotifications() {
+  if (!confirm("Are you sure you want to send Telegram score notifications to candidates with evaluated results?")) return;
+  adminResultsStatus = "Sending notifications to candidates via Telegram...";
+  render();
+  try {
+    var adminHash = sessionStorage.getItem("adminAuthHash") || EXPECTED_ADMIN_HASH;
+    var res = await fetch("/api/admin/send-results-notifications", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-admin-hash": adminHash
+      }
+    });
+    if (res.ok) {
+      var data = await res.json();
+      adminResultsStatus = "✅ Successfully sent notifications to " + data.sentCount + " candidate(s)!";
+    } else {
+      adminResultsStatus = "❌ Failed to send score notifications. Please check admin authorization.";
+    }
+  } catch (e) {
+    adminResultsStatus = "❌ Error: " + e.message;
+  }
+  render();
+}
+
+function renderResultsTabHTML(tabs) {
+  var html =
+    '<div class="admin-panel" style="max-width:850px"><div class="admin-title">Candidate Band Score Results</div>' +
+    tabs;
+
+  if (adminResultsStatus) {
+    html += '<div class="banner" style="background:rgba(14,165,233,0.12);color:#0284c7;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:13px;font-weight:600">' + esc(adminResultsStatus) + '</div>';
+  }
+
+  html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap">' +
+    '<div><button class="btn-primary" onclick="adminSendResultsNotifications()" style="padding:8px 14px;font-size:13px">📤 Send Score Notifications to Candidates</button></div>' +
+    '<div><button class="btn-secondary" onclick="adminLoadResults()" style="padding:6px 12px;font-size:12px">🔄 Refresh Results</button></div>' +
+    '</div>';
+
+  if (adminResultsLoading) {
+    html += '<div style="text-align:center;padding:24px;color:var(--muted)">Loading recorded results...</div>';
+  } else if (!adminResultsList || adminResultsList.length === 0) {
+    html += '<div style="text-align:center;padding:24px;color:var(--muted);background:var(--border2);border-radius:8px">No candidate band scores recorded in Results sheet yet.</div>';
+  } else {
+    html += '<div style="overflow-x:auto"><table class="results-table" style="width:100%;border-collapse:collapse;font-size:13px">' +
+      '<thead><tr style="border-bottom:2px solid var(--border);text-align:left;color:var(--muted)">' +
+      '<th style="padding:8px">Candidate No</th>' +
+      '<th style="padding:8px">Name</th>' +
+      '<th style="padding:8px">Listening</th>' +
+      '<th style="padding:8px">Reading</th>' +
+      '<th style="padding:8px">Writing</th>' +
+      '<th style="padding:8px">Speaking</th>' +
+      '<th style="padding:8px">Overall</th>' +
+      '<th style="padding:8px">Date</th>' +
+      '</tr></thead><tbody>';
+
+    for (var i = 0; i < adminResultsList.length; i++) {
+      var r = adminResultsList[i];
+      html += '<tr style="border-bottom:1px solid var(--border)">' +
+        '<td style="padding:8px"><code>' + esc(r.CandidateNumber) + '</code></td>' +
+        '<td style="padding:8px;font-weight:600">' + esc(r.Name) + '</td>' +
+        '<td style="padding:8px">' + esc(r.ListeningBandScore || '-') + '</td>' +
+        '<td style="padding:8px">' + esc(r.ReadingBandScore || '-') + '</td>' +
+        '<td style="padding:8px">' + esc(r.WritingBandScore || '-') + '</td>' +
+        '<td style="padding:8px">' + esc(r.SpeakingBandScore || '-') + '</td>' +
+        '<td style="padding:8px;font-weight:700;color:var(--accent)">' + esc(r.OverallBandScore || r.LRAverageBandScore || '-') + '</td>' +
+        '<td style="padding:8px;font-size:11px;color:var(--muted)">' + esc(r.Timestamp || '') + '</td>' +
+        '</tr>';
+    }
+
+    html += '</tbody></table></div>';
+  }
+
+  html += '</div>';
+  return html;
+}
+
 function adminSwitchTab(tab) {
   adminActiveTab = tab;
   if (tab === "sessions") {
@@ -3403,6 +3518,7 @@ function adminSwitchTab(tab) {
     };
   }
   if (tab === "students") adminLoadStudents();
+  if (tab === "results") adminLoadResults();
   if (tab === "bot") {
     // Load whichever sub-tab is active so the user sees data immediately.
     if (adminBotSubtab === "texts" && !adminBotTexts) adminBotLoadTexts();
