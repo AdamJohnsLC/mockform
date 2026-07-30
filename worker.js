@@ -652,10 +652,21 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
           headers: corsHeaders,
         });
       }
-    } else if (sheet === "Settings" && subPath.startsWith("/search")) {
-      let k = qsParams.Key;
-      if (k && dataObj[k] !== undefined) {
-        return new Response(JSON.stringify([{ Value: dataObj[k] }]), {
+    } else if (sheet === "Settings") {
+      if (subPath.startsWith("/search")) {
+        let k = qsParams.Key;
+        if (k && dataObj[k] !== undefined) {
+          return new Response(JSON.stringify([{ Value: dataObj[k] }]), {
+            status: 200,
+            headers: corsHeaders,
+          });
+        }
+      } else {
+        let arr = Object.keys(dataObj).map((k) => ({
+          Key: k,
+          Value: dataObj[k],
+        }));
+        return new Response(JSON.stringify(arr), {
           status: 200,
           headers: corsHeaders,
         });
@@ -670,8 +681,18 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
   // WRITE OPERATIONS (POST, PATCH, DELETE)
   if (sheet === "Seats") {
     if (method === "POST") {
-      let k = payload.Slot;
-      if (k) dataObj[k] = Number(payload.Remaining || 0);
+      if (payload && typeof payload.Seats === "object") {
+        dataObj = payload.Seats;
+      } else if (Array.isArray(payload)) {
+        dataObj = {};
+        payload.forEach(function (item) {
+          let k = item.Slot || item.id;
+          if (k) dataObj[k] = Number(item.Remaining !== undefined ? item.Remaining : item.remaining || 0);
+        });
+      } else if (payload) {
+        let k = payload.Slot || payload.slot;
+        if (k) dataObj[k] = Number(payload.Remaining !== undefined ? payload.Remaining : payload.remaining || 0);
+      }
     } else if (method === "PATCH" || method === "DELETE") {
       let parts = subPath.split("/").filter(Boolean);
       if (parts.length === 2 && parts[0] === "Slot") {
@@ -684,12 +705,18 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
       }
     }
   } else if (sheet === "Settings") {
-    if (method === "PATCH") {
-      let parts = subPath.split("/").filter(Boolean);
-      if (parts.length === 2 && parts[0] === "Key") {
-        let k = decodeURIComponent(parts[1]);
-        if (payload && payload.Value !== undefined) {
-          dataObj[k] = payload.Value;
+    if (method === "POST" || method === "PATCH") {
+      if (payload && typeof payload.Settings === "object") {
+        Object.assign(dataObj, payload.Settings);
+      } else if (payload && payload.Key && payload.Value !== undefined) {
+        dataObj[payload.Key] = payload.Value;
+      } else {
+        let parts = subPath.split("/").filter(Boolean);
+        if (parts.length === 2 && parts[0] === "Key") {
+          let k = decodeURIComponent(parts[1]);
+          if (payload && payload.Value !== undefined) {
+            dataObj[k] = payload.Value;
+          }
         }
       }
     }

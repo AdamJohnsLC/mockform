@@ -2311,106 +2311,90 @@ function migrateLegacySession(s) {
 
 async function loadSessionConfig() {
   sessionConfigError = null;
-  // Wrap the session-config branch in an IIFE so an early return only skips
-  // the CDI session list, NOT the mode/Regular config loads below.
-  await (async function loadSessionsOnly() {
   try {
-    var res = await fetch(API + "/search?sheet=Settings&Key=session_config");
-    if (!res.ok) return; // Use defaults if not found
+    var res = await fetch(API + "?sheet=Settings");
+    if (!res.ok) return;
     var rows = await res.json();
-    if (!rows || !rows.length) return;
-    var val =
-      rows[0]["Value"] !== undefined ? rows[0]["Value"] : rows[0]["value"];
-    if (!val) return;
-    var parsed = JSON.parse(val);
-    if (!Array.isArray(parsed) || !parsed.length) {
-      sessionConfigError =
-        "Session config is malformed — using defaults. Check the session_config value in the Settings sheet.";
-      return;
-    }
-    SLOTS = parsed.map(migrateLegacySession);
-    VALID_SLOT_IDS = SLOTS.map(function (s) {
-      return s.id;
+    if (!Array.isArray(rows)) return;
+
+    var sMap = {};
+    rows.forEach(function (r) {
+      var k = r["Key"] || r["key"];
+      var v = r["Value"] !== undefined ? r["Value"] : r["value"];
+      if (k) sMap[k] = v;
     });
-    var newSeats = {};
-    SLOTS.forEach(function (s) {
-      newSeats[s.id] = seats[s.id] !== undefined ? seats[s.id] : s.mainSeats;
-      newSeats["__max__" + s.id] = s.mainSeats;
-    });
-    // Preserve any speak_* pool counts we've already loaded.
-    Object.keys(seats).forEach(function (k) {
-      if (k.indexOf("speak_") === 0 || k.indexOf("__max__speak_") === 0) {
-        newSeats[k] = seats[k];
-      }
-    });
-    seats = newSeats;
-  } catch (e) {
-    sessionConfigError = "Session config error: " + e.message;
-  }
-  })();
-  // Day-level config
-  try {
-    var dr = await fetch(API + "/search?sheet=Settings&Key=session_day_config");
-    if (dr.ok) {
-      var drows = await dr.json();
-      if (drows && drows.length) {
-        var dv = drows[0]["Value"] || drows[0]["value"];
-        if (dv) {
-          var d = JSON.parse(dv);
-          if (d && typeof d === "object") {
-            if (d.dayStart) dayConfig.dayStart = d.dayStart;
-            if (d.dayClose) dayConfig.dayClose = d.dayClose;
-            dayConfig.dayCloseOverride = !!d.dayCloseOverride;
-          }
+
+    // 1. Parse session_config
+    if (sMap["session_config"]) {
+      try {
+        var parsed = JSON.parse(sMap["session_config"]);
+        if (Array.isArray(parsed) && parsed.length) {
+          SLOTS = parsed.map(migrateLegacySession);
+          VALID_SLOT_IDS = SLOTS.map(function (s) { return s.id; });
+          var newSeats = {};
+          SLOTS.forEach(function (s) {
+            newSeats[s.id] = seats[s.id] !== undefined ? seats[s.id] : s.mainSeats;
+            newSeats["__max__" + s.id] = s.mainSeats;
+          });
+          Object.keys(seats).forEach(function (k) {
+            if (k.indexOf("speak_") === 0 || k.indexOf("__max__speak_") === 0) {
+              newSeats[k] = seats[k];
+            }
+          });
+          seats = newSeats;
         }
+      } catch (e) {
+        sessionConfigError = "Session config error: " + e.message;
       }
     }
-  } catch (e3) {}
-  normalizeDayConfig();
-  // Load registration mode (with legacy migration)
-  try {
-    var mr = await fetch(API + "/search?sheet=Settings&Key=registration_mode");
-    if (mr.ok) {
-      var mrows = await mr.json();
-      if (mrows && mrows.length) {
-        var mv = String(mrows[0]["Value"] || mrows[0]["value"] || "").trim();
-        if (mv === "regular") registrationMode = "regular";
-        else if (mv === "cdi" || mv === "lr_only" || mv === "main_speaking") registrationMode = "cdi";
-        // empty / unknown → keep default "cdi"
-      }
+
+    // 2. Parse session_day_config
+    if (sMap["session_day_config"]) {
+      try {
+        var d = JSON.parse(sMap["session_day_config"]);
+        if (d && typeof d === "object") {
+          if (d.dayStart) dayConfig.dayStart = d.dayStart;
+          if (d.dayClose) dayConfig.dayClose = d.dayClose;
+          dayConfig.dayCloseOverride = !!d.dayCloseOverride;
+        }
+      } catch (e) {}
     }
-  } catch (e2) {}
-  // Load Regular-mode config (idempotent — these may not exist yet)
-  try {
-    var ra = await fetch(API + "/search?sheet=Settings&Key=regular_arrival_at");
-    if (ra.ok) {
-      var raRows = await ra.json();
-      if (raRows && raRows.length) regularConfig.arrivalAt = String(raRows[0]["Value"] || raRows[0]["value"] || "");
+    normalizeDayConfig();
+
+    // 3. Parse registration_mode
+    if (sMap["registration_mode"]) {
+      var mv = String(sMap["registration_mode"]).trim();
+      if (mv === "regular") registrationMode = "regular";
+      else if (mv === "cdi" || mv === "lr_only" || mv === "main_speaking") registrationMode = "cdi";
     }
-  } catch (e3) {}
-  try {
-    var ri = await fetch(API + "/search?sheet=Settings&Key=regular_instructions");
-    if (ri.ok) {
-      var riRows = await ri.json();
-      if (riRows && riRows.length) regularConfig.instructions = String(riRows[0]["Value"] || riRows[0]["value"] || "");
-    }
-  } catch (e4) {}
+
+    // 4. Parse regularConfig
+    if (sMap["regular_arrival_at"] !== undefined) regularConfig.arrivalAt = String(sMap["regular_arrival_at"]);
+    if (sMap["regular_instructions"] !== undefined) regularConfig.instructions = String(sMap["regular_instructions"]);
+
+    // 5. Parse deadline & test_date
+    if (sMap["deadline"]) deadline = new Date(sMap["deadline"]);
+    if (sMap["test_date"]) testDate = new Date(sMap["test_date"]);
+
+  } catch (err) {
+    console.warn("Settings batch load error:", err);
+  }
 }
 
 async function saveRegularConfig(cfg) {
-  // Two PATCH calls — same plumbing as deadline/test_date.
-  var resA = await fetch(API + "/Key/regular_arrival_at?sheet=Settings", {
-    method: "PATCH",
+  var res = await fetch(API + "?sheet=Settings", {
+    method: "POST",
     headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH },
-    body: JSON.stringify({ data: { Value: cfg.arrivalAt || "" } }),
+    body: JSON.stringify({
+      data: {
+        Settings: {
+          regular_arrival_at: cfg.arrivalAt || "",
+          regular_instructions: cfg.instructions || ""
+        }
+      }
+    }),
   });
-  if (!resA.ok) throw new Error("regular_arrival_at: HTTP " + resA.status);
-  var resB = await fetch(API + "/Key/regular_instructions?sheet=Settings", {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH },
-    body: JSON.stringify({ data: { Value: cfg.instructions || "" } }),
-  });
-  if (!resB.ok) throw new Error("regular_instructions: HTTP " + resB.status);
+  if (!res.ok) throw new Error("saveRegularConfig: HTTP " + res.status);
 }
 
 async function saveDayConfig(dc) {
@@ -2570,51 +2554,22 @@ async function syncSeatsSheet(sessions) {
     }
   });
 
-  // ── Step 3: Fire all API calls (memory stays unchanged until all succeed) ──
-  for (var j = 0; j < updates.length; j++) {
-    var u = updates[j];
-    if (u.op === "delete") {
-      var delRes = await fetch(
-        API + "/Slot/" + encodeURIComponent(u.id) + "?sheet=Seats",
-        {
-          method: "DELETE",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Admin-Hash": ADMIN_HASH,
-          },
-        },
-      );
-      if (!delRes.ok)
-        throw new Error(
-          "Seat DELETE failed for " + u.id + " (HTTP " + delRes.status + ")",
-        );
-    } else if (u.op === "patch") {
-      var patchRes = await fetch(
-        API + "/Slot/" + encodeURIComponent(u.id) + "?sheet=Seats",
-        {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ data: { Remaining: u.remaining } }),
-        },
-      );
-      if (!patchRes.ok)
-        throw new Error(
-          "Seat PATCH failed for " + u.id + " (HTTP " + patchRes.status + ")",
-        );
-    } else {
-      var postRes = await fetch(API + "?sheet=Seats", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Admin-Hash": ADMIN_HASH,
-        },
-        body: JSON.stringify({ data: { Slot: u.id, Remaining: u.remaining } }),
-      });
-      if (!postRes.ok)
-        throw new Error(
-          "Seat POST failed for " + u.id + " (HTTP " + postRes.status + ")",
-        );
-    }
+  // ── Step 3: Fire single atomic batch update call for all seats ──
+  var fullSeatsMap = {};
+  desired.forEach(function (d) {
+    fullSeatsMap[d.id] = d.remaining;
+  });
+
+  var postRes = await fetch(API + "?sheet=Seats", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Admin-Hash": ADMIN_HASH,
+    },
+    body: JSON.stringify({ data: { Seats: fullSeatsMap } }),
+  });
+  if (!postRes.ok) {
+    throw new Error("Seat batch save failed (HTTP " + postRes.status + ")");
   }
 
   // ── Step 4: All calls succeeded — update memory ───────────────────────
@@ -3509,6 +3464,7 @@ function adminSwitchTab(tab) {
               : SPEAKING_GAP_DEFAULT,
           speakingDuration: Number(s.speakingDuration) || SPEAK_DURATION_DEFAULT,
           teachers: s.teachers !== undefined ? Number(s.teachers) : 0,
+          speakingEnabled: s.speakingEnabled !== undefined ? !!s.speakingEnabled : Number(s.teachers) > 0,
         };
       });
     adminDayDraft = adminDayDraft || {
@@ -3701,11 +3657,22 @@ function adminAddSession() {
     });
   }
   var newId = "main_custom_" + Date.now();
-  // Inherit speaking config from an existing row so the grid stays coherent.
   var template = adminSessionDraft[0] || {};
+
+  // Auto-calculate start time for new session based on last session's start time + mainDuration + 2*bufferMinutes
+  var nextLabel = "08:00";
+  if (adminSessionDraft.length > 0) {
+    var lastS = adminSessionDraft[adminSessionDraft.length - 1];
+    var lastStart = toMin(lastS.label || "08:00");
+    var lastDur = Number(lastS.mainDuration) || MAIN_DURATION_DEFAULT;
+    var lastBuf = lastS.bufferMinutes !== undefined ? Number(lastS.bufferMinutes) : SPEAKING_GAP_DEFAULT;
+    var calculatedNext = lastStart + lastDur + (2 * lastBuf);
+    nextLabel = toHHMM(calculatedNext);
+  }
+
   adminSessionDraft.push({
     id: newId,
-    label: "00:00",
+    label: nextLabel,
     mainSeats: 10,
     period: "",
     speakingEnabled: template.speakingEnabled !== false,
@@ -3907,9 +3874,12 @@ async function adminClearDates() {
   var btn = document.querySelector(".admin-panel .btn-danger");
   if (btn) { btn.disabled = true; btn.textContent = "Clearing…"; }
   try {
-    // Clear both from Cloudflare
-    await fetch(API + "/Key/deadline?sheet=Settings", { method: "PATCH", headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH }, body: JSON.stringify({ data: { Value: "" } }) });
-    await fetch(API + "/Key/test_date?sheet=Settings", { method: "PATCH", headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH }, body: JSON.stringify({ data: { Value: "" } }) });
+    // Clear both from Cloudflare in 1 batched call
+    await fetch(API + "?sheet=Settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Admin-Hash": ADMIN_HASH },
+      body: JSON.stringify({ data: { Settings: { deadline: "", test_date: "" } } })
+    });
     
     deadline = null;
     testDate = null;
