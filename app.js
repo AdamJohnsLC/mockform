@@ -517,7 +517,10 @@ async function addRegistration(payload) {
       errObj = await res.json();
     } catch (e) {}
     if (errObj.error === "DUPLICATE_PHONE") throw new Error("DUPLICATE_PHONE");
-    throw new Error("API error " + res.status);
+    if (errObj.error === "SESSION_FULL") throw new Error("SESSION_FULL");
+    if (errObj.error === "SPEAKING_SLOT_FULL") throw new Error("SPEAKING_SLOT_FULL");
+    if (errObj.error === "SPEAKING_OVERLAPS_MAIN") throw new Error("SPEAKING_OVERLAPS_MAIN");
+    throw new Error(errObj.message || errObj.error || ("API error " + res.status));
   }
   try {
     return await res.json();
@@ -2005,6 +2008,7 @@ function validate() {
 }
 
 async function submitForm() {
+  if (submitting) return;
   errors = validate();
   if (Object.keys(errors).length > 0) {
     render();
@@ -2163,6 +2167,17 @@ async function submitForm() {
 
     if (err.message === "DUPLICATE_PHONE") {
       errors.phone = "A user with this phone number is already registered.";
+      render();
+    } else if (err.message === "SESSION_FULL") {
+      alert("Sorry, this main session just filled up. Please choose another session.");
+      await loadSessionConfig();
+      step = 1;
+      render();
+    } else if (err.message === "SPEAKING_SLOT_FULL") {
+      alert("Sorry, that speaking slot just filled up. Please choose another speaking slot.");
+      await loadSessionConfig();
+      form.speak = null;
+      step = 6;
       render();
     } else {
       var banner = document.createElement("div");

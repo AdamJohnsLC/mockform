@@ -2247,8 +2247,19 @@ async function validateScheduling(db, registrations, payload) {
   const sess = sessions.find((s) => String(s.label).trim() === sessionLabel);
   if (!sess) return "SESSION_NOT_FOUND";
 
+  // Main Session Capacity Check: count existing registrations holding this exact main session
+  const maxMainSeats = Number(sess.mainSeats) || Number(sess.maxSeats) || 10;
+  let mainHeld = 0;
+  if (Array.isArray(registrations)) {
+    for (const r of registrations) {
+      const ms = String(r.Session || r.session || "").replace(/ \(est\.\)$/, "").trim();
+      if (ms === sessionLabel) mainHeld++;
+    }
+  }
+  if (mainHeld >= maxMainSeats) return "SESSION_FULL";
+
   const speakRaw = payload.SpeakingTime;
-  if (!speakRaw) return null; // L+R only — nothing more to check
+  if (!speakRaw) return null; // L+R only — session check done!
   const speakLabel = String(speakRaw).replace(/ \(est\.\)$/, "").trim();
   if (!/^\d{1,2}:\d{2}$/.test(speakLabel)) return null;
 
