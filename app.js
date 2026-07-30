@@ -1397,15 +1397,18 @@ function renderManage() {
 }
 
 var newSpeakChoice = null;
+var changeSpeakError = null;
 
 function goChangeSpeakSlot() {
   newSpeakChoice = null;
+  changeSpeakError = null;
   step = 7;
   render();
 }
 
 function selectNewSpeak(label) {
   newSpeakChoice = newSpeakChoice === label ? null : label;
+  changeSpeakError = null;
   render();
 }
 
@@ -1466,9 +1469,13 @@ function renderChangeSpeak() {
   }).join("");
 
   var canConfirm = !!newSpeakChoice && newSpeakChoice !== currentSpeak;
+  var errCard = changeSpeakError
+    ? '<div class="err-banner" style="margin-bottom:14px"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg><span>' + esc(changeSpeakError) + '</span></div>'
+    : "";
 
   return (
     '<div class="section-label">Change Speaking Time</div>' +
+    errCard +
     '<div class="selected-slot-recap" style="margin-bottom:16px"><div>' +
     '<div style="font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:3px">Current registration</div>' +
     '<div class="recap-time">Candidate #' + esc(reg.candidateNumber || reg.CandidateNumber) + ' &bull; ' + esc(reg.slotLabel) + ' &bull; Current Speaking: ' + esc(currentSpeak) + '</div></div></div>' +
@@ -1489,6 +1496,7 @@ async function confirmChangeSpeakSlot() {
   var currentSpeak = String(reg.speakTime || "").replace(/ \(est\.\)$/, "").trim();
   if (newSpeakChoice === currentSpeak) return;
 
+  changeSpeakError = null;
   submitting = true;
   render();
 
@@ -1513,14 +1521,15 @@ async function confirmChangeSpeakSlot() {
       await loadSessionConfig();
       step = 3;
     } else {
-      var errMsg = data.error === "SPEAKING_SLOT_FULL"
+      changeSpeakError = data.error === "SPEAKING_SLOT_FULL"
         ? "Sorry! That speaking slot was just taken by another candidate. Please select another slot."
         : (data.message || data.error || "Failed to update speaking time.");
-      alert(errMsg);
+      showToast(changeSpeakError, "error");
       await loadSessionConfig();
     }
   } catch (err) {
-    alert("Network error updating speaking time. Please check your connection.");
+    changeSpeakError = "Network error updating speaking time. Please check your connection.";
+    showToast(changeSpeakError, "error");
   } finally {
     submitting = false;
     render();

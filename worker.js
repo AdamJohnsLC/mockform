@@ -4,7 +4,7 @@
 const APP_SCRIPT_URL="https://script.google.com/macros/s/AKfycbxRzENke9rtXj2GPdZU7ztYEUlim3f8n0SB_7Nas1rJ4GVOwb-y-eq_Sko28OI2kc-v/exec";
 
 const ALLOWED_PATH =
-  /^(\/?|\/search|\/Slot\/[^/?]+|\/Phone\/[^/?]+|\/Key\/[^/?]+|\/admin\/.+)(\?.*)?$/;
+  /^(\/?|\/search|\/change-speaking-slot|\/Slot\/[^/?]+|\/Phone\/[^/?]+|\/Key\/[^/?]+|\/admin\/.+)(\?.*)?$/;
 const EXPECTED_ADMIN_HASH =
   "4e00966f7d1e666e33b9f63bfad60646e023890a664d10a2e9df11331c46d976";
 
