@@ -112,6 +112,10 @@ async function handleApi(request, env, url, ctx) {
     } catch (e) {}
   }
 
+  if (subPath === "/change-speaking-slot" && request.method === "POST") {
+    return handleChangeSpeakingSlot(request, env, parsedBody, ctx);
+  }
+
   // ----------------------------------------------------------
   // ALL THREE SHEETS served from Cloudflare KV Edge Database
   // ----------------------------------------------------------
@@ -2462,4 +2466,135 @@ async function handleScheduled(env, ctx) {
       });
     } catch (e) {}
   }
+}
+
+async function handleChangeSpeakingSlot(request, env, parsedBody, ctx) {
+  const db = env.MOCK_DB;
+  const corsHeaders = {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+  };
+  if (!db) {
+    return new Response(JSON.stringify({ error: "Database not bound" }), {
+      status: 500,
+      headers: corsHeaders,
+    });
+  }
+
+  const payload = parsedBody && parsedBody.data ? parsedBody.data : parsedBody;
+  if (!payload || !payload.NewSpeakingTime) {
+    return new Response(
+      JSON.stringify({ error: "NewSpeakingTime is required." }),
+      { status: 400, headers: corsHeaders }
+    );
+  }
+
+  const cn = String(payload.CandidateNumber || "").trim();
+  const phone = String(payload.Phone || "").replace(/\D/g, "").slice(-9);
+  const newTime = String(payload.NewSpeakingTime).replace(/ \(est\.\)$/, "").trim();
+
+  let rows = await db.get("Registrations", "json");
+  if (!Array.isArray(rows)) rows = [];
+
+  const regIndex = rows.findIndex((r) => {
+    const rCN = String(r.CandidateNumber || r.candidatenumber || "").trim();
+    const rPhone = String(r.Phone || r.phone || "").replace(/\D/g, "").slice(-9);
+    return (cn && rCN === cn) || (phone && rPhone === phone);
+  });
+
+  if (regIndex === -1) {
+    return new Response(
+      JSON.stringify({ error: "REGISTRATION_NOT_FOUND", message: "Registration not found." }),
+      { status: 404, headers: corsHeaders }
+    );
+  }
+
+  const reg = rows[regIndex];
+  const oldTime = String(reg.SpeakingTime || reg.speakingtime || "").replace(/ \(est\.\)$/, "").trim();
+
+  if (oldTime === newTime) {
+    return new Response(
+      JSON.stringify({ ok: true, speakingTime: newTime }),
+      { status: 200, headers: corsHeaders }
+    );
+  }
+
+  // Authoritative capacity validation on current live KV roster:
+  // Count how many OTHER candidates hold newTime
+  const settings = (await db.get("Settings", "json")) || {};
+  const cfgRaw = settings.session_config;
+  let capacity = 1;
+  if (cfgRaw) {
+    try {
+      const sessions = typeof cfgRaw === "string" ? JSON.parse(cfgRaw) : cfgRaw;
+      if (Array.isArray(sessions) && sessions.length > 0) {
+        capacity = Number(sessions[0].teachers) || 1;
+      }
+    } catch (e) {}
+  }
+
+  let held = 0;
+  for (const r of rows) {
+    const rCN = String(r.CandidateNumber || r.candidatenumber || "").trim();
+    const rTime = String(r.SpeakingTime || r.speakingtime || "").replace(/ \(est\.\)$/, "").trim();
+    if (rCN !== cn && rTime === newTime) {
+      held++;
+    }
+  }
+
+  if (held >= capacity) {
+    return new Response(
+      JSON.stringify({
+        error: "SPEAKING_SLOT_FULL",
+        message: "That speaking slot was just taken by another candidate. Please choose another slot.",
+      }),
+      { status: 409, headers: corsHeaders }
+    );
+  }
+
+  // Atomically update SpeakingTime in KV
+  rows[regIndex].SpeakingTime = newTime;
+  rows[regIndex].speakingtime = newTime;
+  await db.put("Registrations", JSON.stringify(rows));
+
+  // Update Seats KV map
+  let seatsObj = (await db.get("Seats", "json")) || {};
+  const oldPoolId = "speak_" + oldTime.replace(":", "");
+  const newPoolId = "speak_" + newTime.replace(":", "");
+
+  if (oldTime && seatsObj[oldPoolId] !== undefined) {
+    seatsObj[oldPoolId] = Number(seatsObj[oldPoolId]) + 1; // restore old slot
+  }
+  if (seatsObj[newPoolId] !== undefined) {
+    seatsObj[newPoolId] = Math.max(0, Number(seatsObj[newPoolId]) - 1); // claim new slot
+  }
+  await db.put("Seats", JSON.stringify(seatsObj));
+
+  // Sync to Google Sheets in background
+  if (ctx && ctx.waitUntil) {
+    ctx.waitUntil(
+      (async () => {
+        try {
+          const targetUrl = env.GAS_URL || APP_SCRIPT_URL;
+          if (targetUrl && !targetUrl.includes("PASTE_YOUR_WEB")) {
+            await fetch(targetUrl, {
+              method: "POST",
+              body: JSON.stringify({
+                method: "POST",
+                sheet: "Registrations",
+                path: "",
+                body: rows[regIndex],
+              }),
+              headers: { "Content-Type": "text/plain" },
+            });
+          }
+        } catch (e) {}
+      })()
+    );
+  }
+
+  return new Response(
+    JSON.stringify({ ok: true, speakingTime: newTime }),
+    { status: 200, headers: corsHeaders }
+  );
 }

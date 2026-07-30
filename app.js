@@ -1366,6 +1366,13 @@ function renderManage() {
     '</div>' +
     '<a href="' + tgLink + '" target="_blank" rel="noopener" style="display:inline-block;background:#24a1de;color:#fff;font-size:13px;font-weight:600;padding:8px 16px;border-radius:8px;text-decoration:none;white-space:nowrap">Open Bot</a>' +
     '</div>' +
+    (reg.regular || !reg.speakTime
+      ? ""
+      : isRegistrationClosed()
+        ? ""
+        : '<button class="btn-primary" onclick="goChangeSpeakSlot()" style="margin-bottom:8px" ' +
+          (submitting ? "disabled" : "") +
+          ">Change my speaking time</button>") +
     (reg.regular
       ? "" // Regular mode has no session-picking → no Change button
       : isRegistrationClosed()
@@ -1386,6 +1393,137 @@ function renderManage() {
         ">Cancel my registration</button>") +
     "</div>"
   );
+}
+
+var newSpeakChoice = null;
+
+function goChangeSpeakSlot() {
+  newSpeakChoice = null;
+  step = 7;
+  render();
+}
+
+function selectNewSpeak(label) {
+  newSpeakChoice = newSpeakChoice === label ? null : label;
+  render();
+}
+
+function renderChangeSpeak() {
+  var reg = getRegistration();
+  if (!reg) {
+    step = 1;
+    return renderStep1();
+  }
+  var si = SLOTS.find(function (s) {
+    return s.id === reg.slotId || s.label === reg.slotLabel;
+  });
+  if (!si) {
+    step = 3;
+    return renderManage();
+  }
+
+  var grid = buildSpeakingGrid(SLOTS, dayConfig);
+  var choosableGrid = grid.filter(function (g) {
+    return g.blockedByMain.indexOf(si.id) === -1;
+  });
+
+  var currentSpeak = String(reg.speakTime || "").replace(/ \(est\.\)$/, "").trim();
+
+  var cells = choosableGrid.map(function (g) {
+    var rem = seats[g.poolId] !== undefined ? Number(seats[g.poolId]) : g.capacity;
+    var isMine = g.label === currentSpeak;
+    var isFull = rem <= 0 && !isMine;
+    var isSelected = newSpeakChoice === g.label;
+    var disabled = isFull || g.capacity <= 0 || isMine;
+
+    var reason = "";
+    if (isMine) reason = "Current slot";
+    else if (isFull) reason = "Full";
+    else if (g.capacity <= 0) reason = "No teachers";
+
+    var cls = ["speak-cell"];
+    if (disabled) cls.push("disabled");
+    if (isSelected) cls.push("selected");
+    if (isMine) cls.push("mine");
+    if (isFull) cls.push("full");
+
+    var onclick = disabled ? "" : "onclick=\"selectNewSpeak('" + g.label + "')\"";
+    var title = disabled ? ' title="' + esc(reason) + '"' : "";
+
+    return (
+      '<div class="' + cls.join(" ") + '"' + onclick + title + '>' +
+      '<div class="speak-time">' + g.label + '</div>' +
+      '<div class="speak-seats">' +
+      (isMine
+        ? '<strong style="color:var(--green)">Your slot</strong>'
+        : disabled
+          ? esc(reason)
+          : '<strong>' + rem + '</strong>/' + g.capacity + ' seat' + (g.capacity === 1 ? '' : 's')) +
+      '</div>' +
+      '</div>'
+    );
+  }).join("");
+
+  var canConfirm = !!newSpeakChoice && newSpeakChoice !== currentSpeak;
+
+  return (
+    '<div class="section-label">Change Speaking Time</div>' +
+    '<div class="selected-slot-recap" style="margin-bottom:16px"><div>' +
+    '<div style="font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:3px">Current registration</div>' +
+    '<div class="recap-time">Candidate #' + esc(reg.candidateNumber || reg.CandidateNumber) + ' &bull; ' + esc(reg.slotLabel) + ' &bull; Current Speaking: ' + esc(currentSpeak) + '</div></div></div>' +
+    '<div class="speak-hint">Select a new 15-minute speaking slot for your test day.</div>' +
+    '<div class="speak-grid" style="margin-bottom:20px">' + cells + '</div>' +
+    '<button class="btn-primary" onclick="confirmChangeSpeakSlot()" ' + (canConfirm && !submitting ? "" : "disabled") + '>' +
+    (submitting ? "Updating speaking time…" : "Confirm new speaking time") +
+    '</button>' +
+    '<button class="btn-secondary" onclick="step=3;render()">Cancel</button>'
+  );
+}
+
+async function confirmChangeSpeakSlot() {
+  if (!newSpeakChoice || submitting) return;
+  var reg = getRegistration();
+  if (!reg) return;
+
+  var currentSpeak = String(reg.speakTime || "").replace(/ \(est\.\)$/, "").trim();
+  if (newSpeakChoice === currentSpeak) return;
+
+  submitting = true;
+  render();
+
+  try {
+    var payload = {
+      CandidateNumber: reg.candidateNumber || reg.CandidateNumber || reg.candidatenumber,
+      Phone: reg.phone,
+      NewSpeakingTime: newSpeakChoice
+    };
+
+    var res = await fetch(API + "/change-speaking-slot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    var data = await res.json();
+    if (res.ok && data.ok) {
+      reg.speakTime = data.speakingTime || newSpeakChoice;
+      saveRegistration(reg);
+      showToast("Speaking time updated to " + reg.speakTime, "success");
+      await loadSessionConfig();
+      step = 3;
+    } else {
+      var errMsg = data.error === "SPEAKING_SLOT_FULL"
+        ? "Sorry! That speaking slot was just taken by another candidate. Please select another slot."
+        : (data.message || data.error || "Failed to update speaking time.");
+      alert(errMsg);
+      await loadSessionConfig();
+    }
+  } catch (err) {
+    alert("Network error updating speaking time. Please check your connection.");
+  } finally {
+    submitting = false;
+    render();
+  }
 }
 
 function renderChangeSlot() {
@@ -1528,6 +1666,7 @@ function render() {
     html = renderStep2();
   } else if (step === 3) html = renderManage();
   else if (step === 4) html = renderChangeSlot();
+  else if (step === 7) html = renderChangeSpeak();
   else if (step === 99) {
     html = adminAuthenticated
       ? renderAdminPanelHTML()
