@@ -2569,9 +2569,10 @@ async function handleChangeSpeakingSlot(request, env, parsedBody, ctx) {
     );
   }
 
-  // Atomically update SpeakingTime in KV
-  rows[regIndex].SpeakingTime = newTime;
-  rows[regIndex].speakingtime = newTime;
+  // Format speaking time to match Google Sheets standard format
+  const formattedNewTime = newTime.indexOf("(est.)") !== -1 ? newTime : (newTime + " (est.)");
+  rows[regIndex].SpeakingTime = formattedNewTime;
+  rows[regIndex].speakingtime = formattedNewTime;
   await db.put("Registrations", JSON.stringify(rows));
 
   // Update Seats KV map
@@ -2587,20 +2588,23 @@ async function handleChangeSpeakingSlot(request, env, parsedBody, ctx) {
   }
   await db.put("Seats", JSON.stringify(seatsObj));
 
-  // Sync to Google Sheets in background
+  // Sync to Google Sheets in background via in-place PATCH (updates student's existing row in Sheets)
   if (ctx && ctx.waitUntil) {
     ctx.waitUntil(
       (async () => {
         try {
           const targetUrl = env.GAS_URL || APP_SCRIPT_URL;
           if (targetUrl && !targetUrl.includes("PASTE_YOUR_WEB")) {
+            const regPhone = String(reg.Phone || reg.phone || "").replace(/\D/g, "").slice(-9);
             await fetch(targetUrl, {
-              method: "POST",
+              method: "POST", // Apps Script proxy endpoint receives POST with payload method "PATCH"
               body: JSON.stringify({
-                method: "POST",
+                method: "PATCH",
                 sheet: "Registrations",
-                path: "",
-                body: rows[regIndex],
+                path: "/Phone/998" + regPhone,
+                body: {
+                  SpeakingTime: formattedNewTime
+                }
               }),
               headers: { "Content-Type": "text/plain" },
             });
