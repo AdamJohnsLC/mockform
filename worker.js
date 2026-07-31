@@ -951,6 +951,7 @@ async function botDeepLink(db, token, chatId, phone) {
     await sendTelegram(token, "sendMessage", {
       chat_id: chatId,
       text: "❌ Invalid link. Please use the link from your registration success page.",
+      reply_markup: getReplyKeyboard()
     });
     return;
   }
@@ -974,6 +975,7 @@ async function botDeepLink(db, token, chatId, phone) {
       text:
         "❌ No registration found for this phone number.\n\n" +
         "Please register first at the mock test website, then click the Telegram link on your success page.",
+      reply_markup: getReplyKeyboard()
     });
     return;
   }
@@ -1074,6 +1076,7 @@ async function botStatus(db, token, chatId) {
       text:
         "You haven't linked your registration yet.\n\n" +
         'Register at the mock test website and click the "Get Telegram Reminders" link on your success page.',
+      reply_markup: getReplyKeyboard()
     });
     return;
   }
@@ -1096,6 +1099,7 @@ async function botStatus(db, token, chatId) {
       text:
         "⚠️ Your phone is linked but no active registration was found.\n" +
         "Your registration may have been cancelled.",
+      reply_markup: getReplyKeyboard()
     });
     return;
   }
@@ -1165,6 +1169,7 @@ async function botCandidateNumber(db, token, chatId) {
       text:
         "You haven't linked your registration yet.\n\n" +
         'Register at the mock test website and click the "Get Telegram Reminders" link on your success page.',
+      reply_markup: getReplyKeyboard()
     });
     return;
   }
@@ -1187,6 +1192,7 @@ async function botCandidateNumber(db, token, chatId) {
       text:
         "⚠️ Your phone is linked but no active registration was found.\n" +
         "Your registration may have been cancelled.",
+      reply_markup: getReplyKeyboard()
     });
     return;
   }
@@ -1271,7 +1277,8 @@ async function botResultsByCandidateNumber(db, token, chatId, env, cn) {
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
     text: "🔍 Searching for IELTS Mock results for Candidate Number <code>" + escHtml(cn) + "</code>...",
-    parse_mode: "HTML"
+    parse_mode: "HTML",
+    reply_markup: getReplyKeyboard()
   });
 
   var foundAny = false;
@@ -1391,6 +1398,7 @@ async function botResultsByCandidateNumber(db, token, chatId, env, cn) {
             const htmlBlob = new Blob([fileData.html], { type: "text/html" });
             formData.append("document", htmlBlob, fileData.name || ("IELTS_Result_" + cn + ".html"));
             formData.append("caption", "📄 Official IELTS Result Document (Candidate #" + cn + ")");
+            formData.append("reply_markup", JSON.stringify(getReplyKeyboard()));
 
             await fetch("https://api.telegram.org/bot" + token + "/sendDocument", {
               method: "POST",
@@ -1422,7 +1430,8 @@ async function botLocation(db, token, chatId) {
     chat_id: chatId,
     text: texts.bot_text_location,
     parse_mode: "HTML",
-    disable_web_page_preview: false
+    disable_web_page_preview: false,
+    reply_markup: getReplyKeyboard()
   });
 }
 
@@ -1432,7 +1441,8 @@ async function botRules(db, token, chatId) {
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
     text: texts.bot_text_rules,
-    parse_mode: "HTML"
+    parse_mode: "HTML",
+    reply_markup: getReplyKeyboard()
   });
 }
 
