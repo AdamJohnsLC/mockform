@@ -3578,11 +3578,11 @@ function renderResultsTabHTML(tabs) {
       html += '<tr style="border-bottom:1px solid var(--border)">' +
         '<td style="padding:8px"><code>' + esc(r.CandidateNumber) + '</code></td>' +
         '<td style="padding:8px;font-weight:600">' + esc(r.Name) + '</td>' +
-        '<td style="padding:8px">' + esc(r.ListeningBandScore || '-') + '</td>' +
-        '<td style="padding:8px">' + esc(r.ReadingBandScore || '-') + '</td>' +
-        '<td style="padding:8px">' + esc(r.WritingBandScore || '-') + '</td>' +
-        '<td style="padding:8px">' + esc(r.SpeakingBandScore || '-') + '</td>' +
-        '<td style="padding:8px;font-weight:700;color:var(--accent)">' + esc(r.OverallBandScore || r.LRAverageBandScore || '-') + '</td>' +
+        '<td style="padding:8px">' + esc(r.Listening || r.ListeningBandScore || '-') + '</td>' +
+        '<td style="padding:8px">' + esc(r.Reading || r.ReadingBandScore || '-') + '</td>' +
+        '<td style="padding:8px">' + esc(r.Writing || r.WritingBandScore || '-') + '</td>' +
+        '<td style="padding:8px">' + esc(r.Speaking || r.SpeakingBandScore || '-') + '</td>' +
+        '<td style="padding:8px;font-weight:700;color:var(--accent)">' + esc(r.Overall || r.OverallBandScore || '-') + '</td>' +
         '<td style="padding:8px;font-size:11px;color:var(--muted)">' + esc(r.Timestamp || '') + '</td>' +
         '</tr>';
     }

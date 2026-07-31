@@ -616,19 +616,20 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
         }
       }
 
-      const defaultWriting = isLROnly ? "-" : "Pending Evaluation";
-      const defaultSpeaking = isLROnly ? "-" : "Pending Evaluation";
-      const defaultOverall = isLROnly ? "-" : "Pending";
+      const rawListening = payload.Listening || payload.ListeningBandScore;
+      const rawReading = payload.Reading || payload.ReadingBandScore;
+      const rawWriting = isLROnly ? "-" : (payload.Writing || payload.WritingBandScore);
+      const rawSpeaking = isLROnly ? "-" : (payload.Speaking || payload.SpeakingBandScore);
+      const rawOverall = isLROnly ? "-" : (payload.Overall || payload.OverallBandScore);
 
       const record = {
         CandidateNumber: cn || "000000",
         Name: payload.Name || (candReg ? (candReg.Name || candReg.name) : "Candidate"),
-        ListeningBandScore: payload.ListeningBandScore || "N/A",
-        ReadingBandScore: payload.ReadingBandScore || "N/A",
-        LRAverageBandScore: payload.LRAverageBandScore || "N/A",
-        WritingBandScore: isLROnly ? "-" : (payload.WritingBandScore || defaultWriting),
-        SpeakingBandScore: isLROnly ? "-" : (payload.SpeakingBandScore || defaultSpeaking),
-        OverallBandScore: isLROnly ? (payload.LRAverageBandScore || payload.OverallBandScore || "-") : (payload.OverallBandScore || defaultOverall),
+        Listening: formatCommaScore(rawListening),
+        Reading: formatCommaScore(rawReading),
+        Writing: formatCommaScore(rawWriting),
+        Speaking: formatCommaScore(rawSpeaking),
+        Overall: formatCommaScore(rawOverall),
         TestID: payload.TestID || "Mock_Exam",
         Timestamp: payload.Timestamp || new Date().toISOString()
       };
@@ -654,12 +655,11 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
                   headers: [
                     "CandidateNumber",
                     "Name",
-                    "ListeningBandScore",
-                    "ReadingBandScore",
-                    "LRAverageBandScore",
-                    "WritingBandScore",
-                    "SpeakingBandScore",
-                    "OverallBandScore",
+                    "Listening",
+                    "Reading",
+                    "Writing",
+                    "Speaking",
+                    "Overall",
                     "TestID",
                     "Timestamp"
                   ],
@@ -1299,14 +1299,13 @@ async function botResultsByCandidateNumber(db, token, chatId, env, cn) {
     if (matchedResult) {
       foundAny = true;
       var name = matchedResult.Name || "Candidate";
-      var lScore = matchedResult.ListeningBandScore || "N/A";
-      var rScore = matchedResult.ReadingBandScore || "N/A";
-      var wScore = matchedResult.WritingBandScore || "Pending Evaluation";
-      var sScore = matchedResult.SpeakingBandScore || "Pending Evaluation";
-      var overallScore = matchedResult.OverallBandScore || "Pending";
-      var lrAvg = matchedResult.LRAverageBandScore || lScore;
+      var lScore = formatCommaScore(matchedResult.Listening || matchedResult.ListeningBandScore);
+      var rScore = formatCommaScore(matchedResult.Reading || matchedResult.ReadingBandScore);
+      var wScore = formatCommaScore(matchedResult.Writing || matchedResult.WritingBandScore);
+      var sScore = formatCommaScore(matchedResult.Speaking || matchedResult.SpeakingBandScore);
+      var overallScore = formatCommaScore(matchedResult.Overall || matchedResult.OverallBandScore);
 
-      var isLR = matchedResult.HasSpeaking === false || sScore === "N/A" || sScore === "Not Included";
+      var isLR = (wScore === "-" && sScore === "-");
 
       var scoreMsg = "";
       if (isLR) {
@@ -1314,8 +1313,7 @@ async function botResultsByCandidateNumber(db, token, chatId, env, cn) {
           "👤 <b>Candidate:</b> " + escHtml(name) + "\n" +
           "🆔 <b>Candidate No:</b> <code>" + escHtml(cn) + "</code>\n\n" +
           "🎧 <b>Listening Band:</b> " + escHtml(lScore) + "\n" +
-          "📖 <b>Reading Band:</b> " + escHtml(rScore) + "\n" +
-          "🎯 <b>L&R Average Band:</b> " + escHtml(lrAvg) + "\n";
+          "📖 <b>Reading Band:</b> " + escHtml(rScore) + "\n";
       } else {
         scoreMsg = "📊 <b>Official IELTS Mock Exam Results</b>\n\n" +
           "👤 <b>Candidate:</b> " + escHtml(name) + "\n" +
@@ -1900,14 +1898,13 @@ async function handleAdminRoute(request, env, url, subPath, qsParams, ctx) {
       }
 
       if (targetChatId && token) {
-        const lBand = r.ListeningBandScore || r.listening || r.Listening || "N/A";
-        const rBand = r.ReadingBandScore || r.reading || r.Reading || "N/A";
-        const wBand = r.WritingBandScore || r.writing || r.Writing || "-";
-        const sBand = r.SpeakingBandScore || r.speaking || r.Speaking || "-";
-        const overallBand = r.OverallBandScore || r.overall || r.Overall || "-";
-        const lrAvgBand = r.LRAverageBandScore || r.lrAverage || lBand;
+        const lBand = formatCommaScore(r.Listening || r.ListeningBandScore || r.listening);
+        const rBand = formatCommaScore(r.Reading || r.ReadingBandScore || r.reading);
+        const wBand = formatCommaScore(r.Writing || r.WritingBandScore || r.writing);
+        const sBand = formatCommaScore(r.Speaking || r.SpeakingBandScore || r.speaking);
+        const overallBand = formatCommaScore(r.Overall || r.OverallBandScore || r.overall);
 
-        const isLR = isUnscored(wBand) && isUnscored(sBand);
+        const isLR = (wBand === "-" && sBand === "-");
         let msg = "";
 
         if (isLR) {
@@ -1915,8 +1912,7 @@ async function handleAdminRoute(request, env, url, subPath, qsParams, ctx) {
             "👤 <b>Candidate:</b> " + escHtml(name) + "\n" +
             "🆔 <b>Candidate No:</b> <code>" + escHtml(cn) + "</code>\n\n" +
             "🎧 <b>Listening Band:</b> " + escHtml(lBand) + "\n" +
-            "📖 <b>Reading Band:</b> " + escHtml(rBand) + "\n" +
-            "🎯 <b>L&R Average Band:</b> " + escHtml(lrAvgBand) + "\n\n" +
+            "📖 <b>Reading Band:</b> " + escHtml(rBand) + "\n\n" +
             "<i>Great effort on your exam!</i>";
         } else {
           msg = "📊 <b>Official IELTS Mock Exam Final Results</b>\n\n" +
@@ -2730,4 +2726,12 @@ async function computeAuthoritativeSeats(db) {
   });
 
   return seatsMap;
+}
+
+function formatCommaScore(val) {
+  if (val == null) return "-";
+  let s = String(val).trim();
+  if (!s || s === "N/A" || s === "Pending" || s === "Pending Evaluation" || s === "Not Included" || s === "-") return "-";
+  s = s.replace(/^below\s+/i, "");
+  return s.replace(".", ",");
 }
