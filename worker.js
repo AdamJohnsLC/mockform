@@ -1210,11 +1210,6 @@ async function botCandidateNumber(db, token, chatId) {
 // /results — search and retrieve IELTS results HTML & Band Scores
 async function botResults(db, token, chatId, env) {
   var users = await db.get("TelegramUsers", "json") || {};
-  var candMap = await db.get("TelegramCandidateNumbers", "json") || {};
-
-  // Check saved candidate numbers for this chatId
-  var savedCNs = candMap[chatId] || [];
-  if (!Array.isArray(savedCNs)) savedCNs = [savedCNs];
 
   // Reverse-lookup: find ALL phone numbers linked to this chatId
   var matchedPhones = [];
@@ -1229,7 +1224,7 @@ async function botResults(db, token, chatId, env) {
   if (!Array.isArray(regs)) regs = [];
   regs = regs.map(correctRegistration);
 
-  var candidateNumbersToSearch = new Set(savedCNs);
+  var candidateNumbersToSearch = new Set();
   for (var j = 0; j < regs.length; j++) {
     var rp = String(regs[j].Phone || regs[j].phone || "").replace(/\D/g, "").slice(-9);
     if (matchedPhones.includes(rp)) {
@@ -1273,16 +1268,6 @@ async function botResultsByCandidateNumber(db, token, chatId, env, cn) {
   cn = String(cn).trim();
   if (!cn) return;
 
-  // Store candidate number mapping for this chatId in TelegramCandidateNumbers
-  try {
-    var candMap = await db.get("TelegramCandidateNumbers", "json") || {};
-    if (!Array.isArray(candMap[chatId])) candMap[chatId] = [];
-    if (!candMap[chatId].includes(cn)) {
-      candMap[chatId].push(cn);
-      await db.put("TelegramCandidateNumbers", JSON.stringify(candMap));
-    }
-  } catch (e) {}
-
   await sendTelegram(token, "sendMessage", {
     chat_id: chatId,
     text: "🔍 Searching for IELTS Mock results for Candidate Number <code>" + escHtml(cn) + "</code>...",
@@ -1291,7 +1276,48 @@ async function botResultsByCandidateNumber(db, token, chatId, env, cn) {
 
   var foundAny = false;
 
-  // 1. Search KV Results Sheet for instant band score summary
+  // 1. Fetch fresh scores for this candidate from Google Sheets if available
+  try {
+    var gasTargetUrl = env.GAS_URL || APP_SCRIPT_URL;
+    if (gasTargetUrl && !gasTargetUrl.includes("PASTE_YOUR_WEB")) {
+      var gasResp = await fetch(gasTargetUrl, {
+        method: "POST",
+        body: JSON.stringify({ method: "GET", sheet: "Results" }),
+        headers: { "Content-Type": "text/plain" }
+      });
+      if (gasResp.ok) {
+        var freshData = await gasResp.json();
+        if (Array.isArray(freshData) && freshData.length > 0) {
+          var matchedFresh = freshData.find(r => String(r.CandidateNumber || r.candidateNumber || r.candidate_number || "").trim() === cn);
+          if (matchedFresh) {
+            var currentKVList = await db.get("Results", "json") || [];
+            var kvIdx = currentKVList.findIndex(r => String(r.CandidateNumber || "").trim() === cn);
+            var normalizedFresh = {
+              CandidateNumber: cn,
+              Name: matchedFresh.Name || matchedFresh.name || "Candidate",
+              Listening: formatCommaScore(matchedFresh.Listening || matchedFresh.ListeningBandScore || matchedFresh.listening),
+              Reading: formatCommaScore(matchedFresh.Reading || matchedFresh.ReadingBandScore || matchedFresh.reading),
+              Writing: formatCommaScore(matchedFresh.Writing || matchedFresh.WritingBandScore || matchedFresh.writing),
+              Speaking: formatCommaScore(matchedFresh.Speaking || matchedFresh.SpeakingBandScore || matchedFresh.speaking),
+              Overall: formatCommaScore(matchedFresh.Overall || matchedFresh.OverallBandScore || matchedFresh.overall),
+              TestID: matchedFresh.TestID || matchedFresh.testId || "Mock_Exam",
+              Timestamp: matchedFresh.Timestamp || matchedFresh.timestamp || new Date().toISOString()
+            };
+            if (kvIdx >= 0) {
+              currentKVList[kvIdx] = Object.assign({}, currentKVList[kvIdx], normalizedFresh);
+            } else {
+              currentKVList.push(normalizedFresh);
+            }
+            await db.put("Results", JSON.stringify(currentKVList));
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // Quiet fallback to existing KV data
+  }
+
+  // 2. Search KV Results Sheet for instant band score summary
   try {
     var resultsList = await db.get("Results", "json") || [];
     var matchedResult = resultsList.find(r => String(r.CandidateNumber || "").trim() === cn);
@@ -1336,7 +1362,7 @@ async function botResultsByCandidateNumber(db, token, chatId, env, cn) {
     console.error("Error searching Results KV for candidate " + cn, err);
   }
 
-  // 2. Search Google Drive for full HTML result document
+  // 3. Search Google Drive for full HTML result document (send ONLY the latest file)
   var targetUrl = env.RESULTS_UPLOAD_URL || "https://script.google.com/macros/s/AKfycbx_2KtfAOmA59QRSaXMFRkq0aa4ovsrjBPLcvFCX8JZSoVHC-oVf0i3dU6ju10KUaxS2w/exec";
   try {
     var searchUrl = targetUrl + "?action=search&candidateNumber=" + encodeURIComponent(cn);
@@ -1346,24 +1372,31 @@ async function botResultsByCandidateNumber(db, token, chatId, env, cn) {
       var searchResult = await searchResp.json();
 
       if (searchResult && searchResult.ok && Array.isArray(searchResult.files) && searchResult.files.length > 0) {
-        for (var f = 0; f < searchResult.files.length; f++) {
-          var fileInfo = searchResult.files[f];
-          var fileResp = await fetch(targetUrl + "?action=getFile&fileId=" + fileInfo.id);
-          if (fileResp.ok) {
-            var fileData = await fileResp.json();
-            if (fileData && fileData.ok && fileData.html) {
-              const formData = new FormData();
-              formData.append("chat_id", chatId);
-              const htmlBlob = new Blob([fileData.html], { type: "text/html" });
-              formData.append("document", htmlBlob, fileData.name || ("IELTS_Result_" + cn + ".html"));
-              formData.append("caption", "📄 Official IELTS Result Document (Candidate #" + cn + ")");
+        var filesList = searchResult.files;
+        // Sort descending by timestamp so the latest document comes first
+        filesList.sort(function(a, b) {
+          var tA = new Date(a.createdTime || a.modifiedDate || a.date || 0).getTime();
+          var tB = new Date(b.createdTime || b.modifiedDate || b.date || 0).getTime();
+          return tB - tA;
+        });
 
-              await fetch("https://api.telegram.org/bot" + token + "/sendDocument", {
-                method: "POST",
-                body: formData
-              });
-              foundAny = true;
-            }
+        // Pick only the latest file to prevent duplicate file transmissions
+        var fileInfo = filesList[0];
+        var fileResp = await fetch(targetUrl + "?action=getFile&fileId=" + fileInfo.id);
+        if (fileResp.ok) {
+          var fileData = await fileResp.json();
+          if (fileData && fileData.ok && fileData.html) {
+            const formData = new FormData();
+            formData.append("chat_id", chatId);
+            const htmlBlob = new Blob([fileData.html], { type: "text/html" });
+            formData.append("document", htmlBlob, fileData.name || ("IELTS_Result_" + cn + ".html"));
+            formData.append("caption", "📄 Official IELTS Result Document (Candidate #" + cn + ")");
+
+            await fetch("https://api.telegram.org/bot" + token + "/sendDocument", {
+              method: "POST",
+              body: formData
+            });
+            foundAny = true;
           }
         }
       }
@@ -1849,7 +1882,17 @@ async function handleAdminRoute(request, env, url, subPath, qsParams, ctx) {
         if (gasResp.ok) {
           const freshData = await gasResp.json();
           if (Array.isArray(freshData) && freshData.length > 0) {
-            resultsList = freshData;
+            resultsList = freshData.map(r => ({
+              CandidateNumber: String(r.CandidateNumber || r.candidateNumber || r.candidate_number || "").trim(),
+              Name: r.Name || r.name || r.student_name || "Candidate",
+              Listening: formatCommaScore(r.Listening || r.ListeningBandScore || r.listening),
+              Reading: formatCommaScore(r.Reading || r.ReadingBandScore || r.reading),
+              Writing: formatCommaScore(r.Writing || r.WritingBandScore || r.writing),
+              Speaking: formatCommaScore(r.Speaking || r.SpeakingBandScore || r.speaking),
+              Overall: formatCommaScore(r.Overall || r.OverallBandScore || r.overall),
+              TestID: r.TestID || r.testId || "Mock_Exam",
+              Timestamp: r.Timestamp || r.timestamp || new Date().toISOString()
+            }));
             await db.put("Results", JSON.stringify(resultsList));
           }
         }
