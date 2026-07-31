@@ -597,16 +597,38 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
     if (method === "POST" && payload) {
       const cn = String(payload.CandidateNumber || "").trim();
       const existingIdx = cn ? resultsList.findIndex(r => String(r.CandidateNumber || "").trim() === cn) : -1;
-      
+
+      // Check if candidate belongs to an L+R Only session
+      let regs = (await db.get("Registrations", "json")) || [];
+      let candReg = regs.find(r => String(r.CandidateNumber || r.candidatenumber || "").trim() === cn);
+      let isLROnly = false;
+      if (candReg) {
+        let settings = (await db.get("Settings", "json")) || {};
+        let cfgRaw = settings.session_config;
+        if (cfgRaw) {
+          try {
+            let sessions = typeof cfgRaw === "string" ? JSON.parse(cfgRaw) : cfgRaw;
+            let sessObj = sessions.find(s => String(s.label).trim() === String(candReg.Session || candReg.session || "").replace(/ \(est\.\)$/, "").trim());
+            if (sessObj && (sessObj.speakingEnabled === false || Number(sessObj.teachers) <= 0)) {
+              isLROnly = true;
+            }
+          } catch (e) {}
+        }
+      }
+
+      const defaultWriting = isLROnly ? "-" : "Pending Evaluation";
+      const defaultSpeaking = isLROnly ? "-" : "Pending Evaluation";
+      const defaultOverall = isLROnly ? "-" : "Pending";
+
       const record = {
         CandidateNumber: cn || "000000",
-        Name: payload.Name || "Candidate",
+        Name: payload.Name || (candReg ? (candReg.Name || candReg.name) : "Candidate"),
         ListeningBandScore: payload.ListeningBandScore || "N/A",
         ReadingBandScore: payload.ReadingBandScore || "N/A",
         LRAverageBandScore: payload.LRAverageBandScore || "N/A",
-        WritingBandScore: payload.WritingBandScore || "Pending Evaluation",
-        SpeakingBandScore: payload.SpeakingBandScore || "Pending Evaluation",
-        OverallBandScore: payload.OverallBandScore || "Pending",
+        WritingBandScore: isLROnly ? "-" : (payload.WritingBandScore || defaultWriting),
+        SpeakingBandScore: isLROnly ? "-" : (payload.SpeakingBandScore || defaultSpeaking),
+        OverallBandScore: isLROnly ? (payload.LRAverageBandScore || payload.OverallBandScore || "-") : (payload.OverallBandScore || defaultOverall),
         TestID: payload.TestID || "Mock_Exam",
         Timestamp: payload.Timestamp || new Date().toISOString()
       };
@@ -618,7 +640,39 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
       }
 
       await db.put("Results", JSON.stringify(resultsList));
-      bgSync(); // Sync to Google Sheets "Results" sheet!
+
+      // Direct header-aware sync to Google Sheets "Results" tab
+      if (targetUrl && !targetUrl.includes("PASTE_YOUR_WEB")) {
+        ctx.waitUntil(
+          (async () => {
+            try {
+              await fetch(targetUrl, {
+                method: "POST",
+                body: JSON.stringify({
+                  method: "POST",
+                  sheet: "Results",
+                  headers: [
+                    "CandidateNumber",
+                    "Name",
+                    "ListeningBandScore",
+                    "ReadingBandScore",
+                    "LRAverageBandScore",
+                    "WritingBandScore",
+                    "SpeakingBandScore",
+                    "OverallBandScore",
+                    "TestID",
+                    "Timestamp"
+                  ],
+                  body: record
+                }),
+                headers: { "Content-Type": "text/plain" }
+              });
+            } catch (e) {
+              console.error("Results sheet GAS sync error:", e);
+            }
+          })()
+        );
+      }
 
       return new Response(JSON.stringify({ ok: true, record }), {
         status: 200,
