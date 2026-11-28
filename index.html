@@ -3,11 +3,11 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'; img-src 'self' data:;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; img-src 'self' data:;">
+  <meta name="description" content="Register for the mock test, choose your session and speaking time, and keep your place across test cycles." />
+  <meta name="theme-color" content="#F7F5F0" />
   <title>Mock Test Registration</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Spectral:wght@400;500;600&family=Outfit:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="preload" href="fonts/geist-variable.woff2" as="font" type="font/woff2" crossorigin>
   <script>
     (function() {
       try {
@@ -22,26 +22,30 @@
     })();
   </script>
   <link rel="stylesheet" href="style.css">
-  
 </head>
 <body>
-  <button id="theme-toggle-btn" class="theme-toggle-fab" aria-label="Toggle theme"></button>
+  <button id="theme-toggle-btn" class="theme-toggle-fab" type="button" aria-label="Toggle theme"></button>
   <div id="app">
-    <div class="header">
-      <div class="header-eyebrow">2026 Admission Prep</div>
-      <div class="header-title" onclick="onHeaderClick()" style="cursor:default;user-select:none">Mock Test Registration</div>
-      <div id="header-subtitle" class="header-subtitle">Select a session and complete your details below</div>
-    </div>
-    <div id="main">
-      <div class="loading-screen">
-        <div class="loading-dots">
-          <div class="loading-dot"></div><div class="loading-dot"></div><div class="loading-dot"></div>
-        </div>
-        <div class="loading-text">Loading seat availability…</div>
+    <header class="header">
+      <div class="header-eyebrow">Candidate registration</div>
+      <h1 class="header-title" id="app-title" onclick="onHeaderClick()">Register once. Stay informed for every test.</h1>
+      <p id="header-subtitle" class="header-subtitle">Your registration follows the current test cycle — when a new test opens, your profile carries over and you pick a seat for the new date.</p>
+    </header>
+    <div id="cycle-status" class="cycle-status" role="status" aria-live="polite"></div>
+    <main id="main">
+      <div class="loading-screen" aria-busy="true">
+        <div class="skeleton-row"><div><div class="skeleton-bar sk-name" style="width:56%"></div><div class="skeleton-bar sk-meta" style="width:34%"></div></div><div class="skeleton-bar sk-btn"></div></div>
+        <div class="skeleton-row"><div><div class="skeleton-bar sk-name" style="width:46%"></div><div class="skeleton-bar sk-meta" style="width:28%"></div></div><div class="skeleton-bar sk-btn"></div></div>
+        <div class="loading-text">Checking seat availability…</div>
       </div>
-    </div>
+    </main>
+    <footer class="site-footer">
+      <span class="venue">Venue — 24th School Branch ·
+        <a href="https://maps.app.goo.gl/TTibuZHDg4HzDf4E8" target="_blank" rel="noopener">Open map</a>
+      </span>
+      <a class="admin-link" href="#/admin">Admin console</a>
+    </footer>
   </div>
   <script src="app.js"></script>
-  
 </body>
 </html>

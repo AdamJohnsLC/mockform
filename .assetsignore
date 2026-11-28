@@ -1,0 +1,5 @@
+.git/
+.wrangler/
+.mlai/
+node_modules/
+*.log

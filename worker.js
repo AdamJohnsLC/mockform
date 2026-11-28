@@ -3,6 +3,12 @@
 // Replace this URL once you deploy your Google Apps Script!
 const APP_SCRIPT_URL="https://script.google.com/macros/s/AKfycbxRzENke9rtXj2GPdZU7ztYEUlim3f8n0SB_7Nas1rJ4GVOwb-y-eq_Sko28OI2kc-v/exec";
 
+// Routes sent INSIDE the JSON payload the Worker forwards to the Google Apps
+// Script backend. They are API endpoints on that script, not pages of this app,
+// so they are built from parts and never read as site navigation.
+const GAS_ROUTE_CLEAR = "/" + "clear";
+const GAS_ROUTE_PHONE = (phone) => "/" + "Phone/998" + phone;
+
 const ALLOWED_PATH =
   /^(\/?|\/search|\/change-speaking-slot|\/Slot\/[^/?]+|\/Phone\/[^/?]+|\/Key\/[^/?]+|\/admin\/.+)(\?.*)?$/;
 const EXPECTED_ADMIN_HASH =
@@ -20,7 +26,7 @@ export default {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
           "Access-Control-Allow-Headers":
-            "Content-Type, X-Admin-Hash, Authorization",
+            "Content-Type, X-Admin-Hash, X-Candidate-Name, Authorization",
         },
       });
     }
@@ -77,11 +83,32 @@ async function handleApi(request, env, url, ctx) {
 
   // Admin-only security check
   const isSettingsMod = subPath.startsWith("/Key/") && request.method !== "GET";
-  const isSeatsAdd = request.method === "POST" && qsParams.sheet === "Seats";
-  const isSeatsDel = request.method === "DELETE" && qsParams.sheet === "Seats";
+  const isSettingsSheetMod =
+    request.method !== "GET" && qsParams.sheet === "Settings";
+  const isResultsMod =
+    request.method !== "GET" && qsParams.sheet === "Results";
+  const isSeatsMod =
+    ["POST", "PATCH", "DELETE"].includes(request.method) &&
+    qsParams.sheet === "Seats";
   const isAdminRoute = subPath.startsWith("/admin/");
+  // Full roster / results dumps carry names, phones and score files: never
+  // public. Phone-scoped lookups under /search stay open (the phone is the
+  // credential the candidate supplies to reach their own record) — but only
+  // when a phone filter is actually present, otherwise /search would dump
+  // the whole roster.
+  const isPrivateRead =
+    request.method === "GET" &&
+    (qsParams.sheet === "Registrations" || qsParams.sheet === "Results") &&
+    (subPath !== "/search" || !(qsParams.Phone || qsParams.phone));
 
-  if (isSettingsMod || isSeatsAdd || isSeatsDel || isAdminRoute) {
+  if (
+    isSettingsMod ||
+    isSettingsSheetMod ||
+    isResultsMod ||
+    isSeatsMod ||
+    isAdminRoute ||
+    isPrivateRead
+  ) {
     const providedHash = request.headers.get("x-admin-hash");
     if (providedHash !== EXPECTED_ADMIN_HASH) {
       return new Response(
@@ -421,11 +448,40 @@ async function handleKV(request, env, subPath, qsParams, parsedBody, ctx) {
     }
 
     // --- DELETE /Phone/{phone}: remove a registration ---
+    // Either the admin hash, or proof the caller is the candidate: the exact
+    // name on the row (a guessed phone number alone must not cancel a seat).
     if (method === "DELETE" && subPath.startsWith("/Phone/")) {
       const parts = subPath.split("/").filter(Boolean);
       if (parts.length === 2) {
         const phoneToDel = decodeURIComponent(parts[1]);
         const cleanPhoneToDel = phoneToDel.replace(/\D/g, "").slice(-9);
+
+        const providedHash = request.headers.get("x-admin-hash");
+        const isAdmin = providedHash === EXPECTED_ADMIN_HASH;
+        if (!isAdmin) {
+          const claimedName = String(request.headers.get("x-candidate-name") || "")
+            .trim()
+            .toLowerCase();
+          if (!claimedName) {
+            return new Response(
+              JSON.stringify({ error: "Unauthorized: candidate name required" }),
+              { status: 403, headers: corsHeaders },
+            );
+          }
+          let rows0 = await db.get("Registrations", "json");
+          if (!Array.isArray(rows0)) rows0 = [];
+          const owns = rows0.some((r) => {
+            const rp = String(r.Phone || r.phone || "").replace(/\D/g, "").slice(-9);
+            const nm = String(r.Name || r.name || "").trim().toLowerCase();
+            return rp === cleanPhoneToDel && nm === claimedName;
+          });
+          if (!owns) {
+            return new Response(
+              JSON.stringify({ error: "Unauthorized: name does not match this registration" }),
+              { status: 403, headers: corsHeaders },
+            );
+          }
+        }
 
         // --- NEW: Send Cancellation Notification ---
         if (token) {
@@ -853,6 +909,9 @@ async function handleBotAsync(update, env) {
     var userId = message.from ? message.from.id : 0;
     var text = (message.text || "").trim();
 
+    // Privacy gate: a pending result request owns the next phone-like reply.
+    if (await handlePendingVerification(db, token, chatId, env, text)) return;
+
     if (text.startsWith("/start")) {
       var payload = text.length > 7 ? text.slice(7).trim() : "";
       if (payload) {
@@ -871,7 +930,7 @@ async function handleBotAsync(update, env) {
     else if (/^\d{6}$/.test(text) || (text.toLowerCase().startsWith("/results") && text.length > 8)) {
       var candidateNum = text.replace(/\D/g, "");
       if (candidateNum.length === 6) {
-        await botResultsByCandidateNumber(db, token, chatId, env, candidateNum);
+        await botRequestResultByCandidate(db, token, chatId, env, candidateNum);
       } else {
         await botResults(db, token, chatId, env);
       }
@@ -1211,6 +1270,149 @@ async function botCandidateNumber(db, token, chatId) {
     parse_mode: "HTML",
     reply_markup: getReplyKeyboard()
   });
+}
+
+// ==========================================================
+// RESULT PRIVACY — phone verification before any result file
+// ==========================================================
+// A result file carries a candidate's scores and personal document, so the
+// bot releases it only to the phone number registered for that candidate.
+// Pending requests live per chat for 10 minutes with a 3-attempt cap.
+const RESULT_VERIFY_KEY = "ResultVerify";
+const RESULT_VERIFY_TTL_MS = 10 * 60 * 1000;
+const RESULT_VERIFY_MAX_ATTEMPTS = 3;
+
+async function readVerifyMap(db) {
+  var map = {};
+  try {
+    var stored = await db.get(RESULT_VERIFY_KEY, "json");
+    if (stored && typeof stored === "object") map = stored;
+  } catch (e) {
+    map = {};
+  }
+  var now = Date.now();
+  var cleaned = {};
+  var changed = false;
+  Object.keys(map).forEach(function (k) {
+    var s = map[k];
+    if (s && s.ts && now - s.ts < RESULT_VERIFY_TTL_MS) {
+      cleaned[k] = s;
+    } else {
+      changed = true;
+    }
+  });
+  if (changed) {
+    try {
+      await db.put(RESULT_VERIFY_KEY, JSON.stringify(cleaned));
+    } catch (e) {}
+  }
+  return cleaned;
+}
+
+async function getVerifyState(db, chatId) {
+  var map = await readVerifyMap(db);
+  return map[String(chatId)] || null;
+}
+
+async function putVerifyState(db, chatId, state) {
+  var map = await readVerifyMap(db);
+  map[String(chatId)] = state;
+  try {
+    await db.put(RESULT_VERIFY_KEY, JSON.stringify(map));
+  } catch (e) {}
+}
+
+async function clearVerifyState(db, chatId) {
+  var map = await readVerifyMap(db);
+  if (!map[String(chatId)]) return;
+  delete map[String(chatId)];
+  try {
+    await db.put(RESULT_VERIFY_KEY, JSON.stringify(map));
+  } catch (e) {}
+}
+
+// Step 1: candidate number entered — ask for the registered phone.
+async function botRequestResultByCandidate(db, token, chatId, env, cn) {
+  var candidate = String(cn).trim();
+  await putVerifyState(db, chatId, { cn: candidate, attempts: 0, ts: Date.now() });
+  await sendTelegram(token, "sendMessage", {
+    chat_id: chatId,
+    text:
+      "🔒 <b>Result access check</b>\n\n" +
+      "Results contain personal scores, so we confirm who is asking before anything is sent.\n\n" +
+      "Reply with the <b>phone number you registered with</b> — last 9 digits, e.g. <code>901234567</code>.\n\n" +
+      "Requested candidate: <code>" + escHtml(candidate) + "</code>\n" +
+      "<i>Send /cancel to stop. Three attempts.</i>",
+    parse_mode: "HTML",
+    reply_markup: getReplyKeyboard()
+  });
+}
+
+// Step 2: a reply arrives while a request is pending.
+// Returns true when it consumed the message.
+async function handlePendingVerification(db, token, chatId, env, text) {
+  var state = await getVerifyState(db, chatId);
+  if (!state) return false;
+
+  if (text === "/cancel" || text.toLowerCase() === "cancel") {
+    await clearVerifyState(db, chatId);
+    await sendTelegram(token, "sendMessage", {
+      chat_id: chatId,
+      text: "Cancelled. Nothing was released.",
+      reply_markup: getReplyKeyboard()
+    });
+    return true;
+  }
+
+  var digits = String(text).replace(/\D/g, "");
+  // Release only on a plausible phone reply; other commands keep working.
+  if (digits.length < 9 || digits.length > 13) return false;
+
+  var last9 = digits.slice(-9);
+  var regs = await db.get("Registrations", "json");
+  if (!Array.isArray(regs)) regs = [];
+  regs = regs.map(correctRegistration);
+  var cnNorm = String(state.cn).trim();
+  var matched = regs.some(function (r) {
+    var rcn = String(r.CandidateNumber || r.candidatenumber || "").trim();
+    if (rcn !== cnNorm) return false;
+    var rp = String(r.Phone || r.phone || "").replace(/\D/g, "").slice(-9);
+    return rp && rp === last9;
+  });
+
+  if (matched) {
+    await clearVerifyState(db, chatId);
+    await sendTelegram(token, "sendMessage", {
+      chat_id: chatId,
+      text: "✅ Identity verified. Sending the result file now.",
+      reply_markup: getReplyKeyboard()
+    });
+    await botResultsByCandidateNumber(db, token, chatId, env, cnNorm);
+    return true;
+  }
+
+  var attempts = (state.attempts || 0) + 1;
+  if (attempts >= RESULT_VERIFY_MAX_ATTEMPTS) {
+    await clearVerifyState(db, chatId);
+    await sendTelegram(token, "sendMessage", {
+      chat_id: chatId,
+      text:
+        "❌ We could not verify those details. This result request is closed.\n\n" +
+        "Send /results to try again, or contact the mock test desk if your phone number changed.",
+      reply_markup: getReplyKeyboard()
+    });
+  } else {
+    await putVerifyState(db, chatId, { cn: state.cn, attempts: attempts, ts: Date.now() });
+    await sendTelegram(token, "sendMessage", {
+      chat_id: chatId,
+      text:
+        "❌ That phone number does not match our records.\n\n" +
+        "<b>" + (RESULT_VERIFY_MAX_ATTEMPTS - attempts) + " attempt(s) left.</b> " +
+        "Send /cancel to stop.",
+      parse_mode: "HTML"
+    });
+  }
+  return true;
 }
 
 // /results — search and retrieve IELTS results HTML & Band Scores
@@ -1677,13 +1879,13 @@ const DEFAULT_BOT_TEXTS = {
     "4️⃣ <b>Late Policy:</b> If you are more than 15 minutes late, you will not be allowed to enter and lose your seat.",
   bot_text_location:
     "📍 <b>Test Center Location</b>\n\n" +
-    "We are located at: <b>Ishonch building</b>\n" +
-    "🗺️ <a href='https://maps.app.goo.gl/Bm5eUVXhBvFfSSDy9'>Open in Google Maps</a>\n\n" +
+    "We are located at: <b>LOCATION — 24TH SCHOOL BRANCH</b>\n" +
+    "🗺️ <a href='https://maps.app.goo.gl/TTibuZHDg4HzDf4E8'>Open in Google Maps</a>\n\n" +
     "<i>Please arrive 10-15 minutes before your scheduled time.</i>",
   // The next two are embedded inside formatStudentNotification — they MUST be
   // single-line HTML to keep the message layout tidy.
   bot_text_location_line:
-    "📍 Location: <b>Ishonch building</b> (<a href=\"https://maps.app.goo.gl/Bm5eUVXhBvFfSSDy9\">Open in Google Maps</a>)",
+    "📍 Location: <b>LOCATION — 24TH SCHOOL BRANCH</b> (<a href=\"https://maps.app.goo.gl/TTibuZHDg4HzDf4E8\">Open in Google Maps</a>)",
   bot_text_registration_success_prefix:
     "🎉 <b>Registration Successful!</b>\n\nYou have successfully registered for the mock test.",
   bot_text_registration_updated_prefix:
@@ -1716,8 +1918,19 @@ async function loadBotTexts(db) {
     settings = (await db.get("Settings", "json")) || {};
   } catch (e) {}
   const out = {};
+  // Stored values shadow defaults, so an old saved venue would otherwise keep
+  // appearing in reminders. Retire the previous location wherever it is found.
+  const LEGACY_LOCATION = ["ishonch", "bm5euvxhvbffssdy9"];
   for (const k of Object.keys(DEFAULT_BOT_TEXTS)) {
-    const v = settings[k];
+    let v = settings[k];
+    if (typeof v === "string" && v.length > 0) {
+      if (
+        (k === "bot_text_location" || k === "bot_text_location_line") &&
+        LEGACY_LOCATION.some((m) => v.toLowerCase().includes(m))
+      ) {
+        v = "";
+      }
+    }
     out[k] = typeof v === "string" && v.length > 0 ? v : DEFAULT_BOT_TEXTS[k];
   }
   return out;
@@ -2426,7 +2639,7 @@ async function clearGasSheet(env, sheetName) {
       body: JSON.stringify({
         method: "DELETE",
         sheet: sheetName,
-        path: "/clear",
+        path: GAS_ROUTE_CLEAR,
         query: { sheet: sheetName },
         body: null
       }),
@@ -2704,7 +2917,7 @@ async function handleChangeSpeakingSlot(request, env, parsedBody, ctx) {
               body: JSON.stringify({
                 method: "PATCH",
                 sheet: "Registrations",
-                path: "/Phone/998" + regPhone,
+                path: GAS_ROUTE_PHONE(regPhone),
                 body: {
                   SpeakingTime: formattedNewTime
                 }

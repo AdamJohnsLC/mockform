@@ -143,6 +143,10 @@ function getRegistration() {
 }
 function saveRegistration(data) {
   try {
+    if (data && !data.cycleId) {
+      var cid = currentCycleId();
+      if (cid) data.cycleId = cid;
+    }
     localStorage.setItem("mock_reg", JSON.stringify(data));
   } catch (e) {}
 }
@@ -151,6 +155,95 @@ function clearRegistration() {
     localStorage.removeItem("mock_reg");
   } catch (e) {}
 }
+
+// --- Test cycle awareness ---
+// A registration belongs to exactly one test cycle. The cycle id is the
+// test_date from Settings, so when staff move the date forward the app can
+// tell "you are registered" from "you were registered last time".
+var staleReg = null;
+var renewalAttempted = false;
+function currentCycleId() {
+  if (testDate && !isNaN(testDate.getTime())) {
+    return "test-" + testDate.toISOString().slice(0, 10);
+  }
+  if (deadline && !isNaN(deadline.getTime())) {
+    return "deadline-" + deadline.toISOString().slice(0, 10);
+  }
+  return null;
+}
+function isStaleRegistration(reg) {
+  var cid = currentCycleId();
+  if (!reg || !cid) return false;
+  return reg.cycleId !== cid;
+}
+
+// --- Draft persistence ---
+// Mid-flow answers survive a closed tab, a refresh or a phone switch.
+var DRAFT_KEY = "mock_draft_v1";
+var DRAFT_STEPS = [1, 5, 6, 2, 4, 7];
+var DRAFT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+function saveDraft() {
+  if (step === 99 || step === 10) return;
+  if (DRAFT_STEPS.indexOf(step) === -1) return;
+  try {
+    localStorage.setItem(
+      DRAFT_KEY,
+      JSON.stringify({
+        v: 1,
+        step: step,
+        mode: registrationMode,
+        cycle: currentCycleId(),
+        form: form,
+        newSlotChoice: newSlotChoice,
+        ts: Date.now(),
+      })
+    );
+  } catch (e) {}
+}
+function readDraft() {
+  try {
+    var raw = localStorage.getItem(DRAFT_KEY);
+    if (!raw) return null;
+    var d = JSON.parse(raw);
+    if (!d || d.v !== 1 || !d.ts) return null;
+    if (Date.now() - d.ts > DRAFT_MAX_AGE_MS) return null;
+    if (DRAFT_STEPS.indexOf(d.step) === -1) return null;
+    if (!d.form || typeof d.form !== "object") return null;
+    var cid = currentCycleId();
+    if (cid && d.cycle && d.cycle !== cid) return null;
+    return d;
+  } catch (e) {
+    return null;
+  }
+}
+function clearDraft() {
+  try {
+    localStorage.removeItem(DRAFT_KEY);
+  } catch (e) {}
+}
+function restoreDraft() {
+  var d = readDraft();
+  if (!d) return false;
+  form.slot = d.form.slot || null;
+  form.speak = d.form.speak || form.speak || null;
+  form.name = typeof d.form.name === "string" ? d.form.name : "";
+  form.phone = typeof d.form.phone === "string" ? d.form.phone : "";
+  form.school = d.form.school || form.school;
+  if (d.newSlotChoice) newSlotChoice = d.newSlotChoice;
+  step = d.step;
+  if (step === 6 && !form.slot) step = 1;
+  return true;
+}
+function flushDraftOnHide() {
+  saveDraft();
+}
+try {
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "hidden") saveDraft();
+  });
+  window.addEventListener("pagehide", saveDraft);
+  window.addEventListener("beforeunload", saveDraft);
+} catch (e) {}
 
 // --- Time helpers (Main+Speaking mode) ---
 function toMin(label) {
@@ -442,6 +535,11 @@ async function loadSeats() {
       clearRegistration();
       existing = null;
       step = 1;
+    } else if (isStaleRegistration(existing) && !cycleNoticeDismissed()) {
+      // Registered for an earlier test cycle — keep the details, ask for a
+      // seat on the current date instead of locking the student out.
+      staleReg = existing;
+      step = 10;
     } else {
       // Test is not over, check if the registration actually exists in the database
       try {
@@ -499,6 +597,11 @@ async function loadSeats() {
     }
   } else {
     step = 1;
+  }
+  if (step === 1 || step === 10) restoreDraft();
+  if (location.hash === "#/admin") {
+    step = 99;
+    adminStatus = "";
   }
   render();
 }
@@ -635,116 +738,79 @@ async function updateRegistrationSlot(
     },
   );
   if (!res.ok) throw new Error("Update API error " + res.status);
+  return res;
+}
+
+// A phone can hold only one registration. Releasing the row from an earlier test
+// is what lets a returning candidate book the current one.
+async function releaseOldRegistration(phone) {
+  var clean = String(phone || "").replace(/\D/g, "").slice(-9);
+  if (!clean) throw new Error("Missing phone number");
+  var res = await fetch(
+    API + "/Phone/" + encodeURIComponent("998" + clean) + "?sheet=Registrations",
+    {
+      method: "DELETE",
+      headers: {
+        "X-Candidate-Name": String(getRegistration().name || form.name || ""),
+      },
+    },
+  );
+  if (!res.ok) throw new Error("Release error " + res.status);
+}
+
+function samePhone(a, b) {
+  var x = String(a || "").replace(/\D/g, "").slice(-9);
+  var y = String(b || "").replace(/\D/g, "").slice(-9);
+  return !!x && x === y;
+}
+
+// The browser already knows this device's registration is from an older test,
+// so the same person can be moved to the new test without another question.
+async function tryAutoRenewal() {
+  if (renewalAttempted) return false;
+  if (!staleReg || !samePhone(staleReg.phone, form.phone)) return false;
+  renewalAttempted = true;
+  try {
+    await releaseOldRegistration(form.phone);
+    await submitForm();
+    return true;
+  } catch (e) {
+    renewalAttempted = false;
+    return false;
+  }
+}
+
+function offerRenewal() {
+  var anchor = document.querySelector(".btn-primary");
+  if (!anchor || !anchor.parentNode) return;
+  var old = document.getElementById("renewal-offer");
+  if (old) old.remove();
+  var box = document.createElement("div");
+  box.id = "renewal-offer";
+  box.className = "renewal-offer";
+  box.innerHTML =
+    "<p><strong>This number is already registered.</strong> If that earlier registration was yours and its test has passed, move it to this test.</p>" +
+    '<button type="button" class="btn-secondary" onclick="confirmRenewal()">Use this number for this test</button>';
+  anchor.parentNode.insertBefore(box, anchor);
+}
+
+async function confirmRenewal() {
+  var box = document.getElementById("renewal-offer");
+  if (box) box.remove();
+  renewalAttempted = true;
+  try {
+    await releaseOldRegistration(form.phone);
+    await submitForm();
+  } catch (e) {
+    renewalAttempted = false;
+    alert("Could not update the earlier registration: " + e.message);
+  }
 }
 
 // New model assigns explicit speaking times at registration, so there's no
 // queue to recompute after a cancellation. This is a no-op shim that keeps
 // the old call sites working.
 async function recalculateSpeakingTimes(slotId) { /* no-op in new model */ }
-
-// LEGACY queue-recalculation kept under a different name in case we ever need
-// to migrate old data — never called.
-async function recalculateSpeakingTimes_LEGACY(slotId) {
-  var si = SLOTS.find(function (s) {
-    return s.id === slotId;
-  });
-  if (!si) return;
-  var teachers = Math.max(1, si.teachers || 1);
-  var start = toMin(si.label);
-  // Google Sheets may auto-convert "HH:MM" session labels to decimal fractions.
-  // Fetch ALL registrations and filter client-side to handle both formats.
-  var sessionDecimal = toMin(si.label) / (24 * 60);
-
-  // Process speaking-first pool
-  try {
-    var sRes = await fetch(API + "?sheet=Registrations");
-    if (sRes.ok) {
-      var rawRegs = await sRes.json();
-      if (Array.isArray(rawRegs)) {
-        // Filter: match by session label string OR by Sheets decimal value
-        var allRegs = rawRegs.filter(function (r) {
-          var raw = String(r.Session || r.session || "")
-            .trim()
-            .replace(",", ".");
-          // Strip sheetTime suffix before comparing
-          var s = raw.replace(/ \(est\.\)$/, "").trim();
-          if (s === si.label) return true;
-          var n = parseFloat(s);
-          return !isNaN(n) && Math.abs(n - sessionDecimal) < 0.00002;
-        });
-        if (!allRegs.length) return;
-        // Filter and sort speaking-first by registration timestamp
-        var speakStudents = allRegs.filter(function (r) {
-          var et = r.ExamType || r.examtype || "";
-          return et.toLowerCase() === "speaking";
-        });
-        speakStudents.sort(function (a, b) {
-          return (
-            new Date(a.Timestamp || a.timestamp || 0) -
-            new Date(b.Timestamp || b.timestamp || 0)
-          );
-        });
-        for (var i = 0; i < speakStudents.length; i++) {
-          var offset = Math.floor(i / teachers) * SPEAK_DURATION;
-          var newSpeak = toHHMM(start + offset);
-          var newMain = toHHMM(start + MAIN_DURATION + SPEAKING_GAP);
-          var ph = speakStudents[i].Phone || speakStudents[i].phone || "";
-          if (ph) {
-            try {
-              await fetch(
-                API + "/Phone/" + phonePathSeg(ph) + "?sheet=Registrations",
-                {
-                  method: "PATCH",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    data: {
-                      SpeakingTime: sheetTime(newSpeak),
-                      MainTime: sheetTime(newMain),
-                    },
-                  }),
-                },
-              );
-            } catch (e2) {}
-          }
-        }
-
-        // Filter and sort main-first by registration timestamp
-        var mainStudents = allRegs.filter(function (r) {
-          var et = r.ExamType || r.examtype || "";
-          return et.toLowerCase() === "main";
-        });
-        mainStudents.sort(function (a, b) {
-          return (
-            new Date(a.Timestamp || a.timestamp || 0) -
-            new Date(b.Timestamp || b.timestamp || 0)
-          );
-        });
-        for (var j = 0; j < mainStudents.length; j++) {
-          var offset2 = Math.floor(j / teachers) * SPEAK_DURATION;
-          var newSpeak2 = toHHMM(start + MAIN_DURATION + SPEAKING_GAP + offset2);
-          var ph2 = mainStudents[j].Phone || mainStudents[j].phone || "";
-          if (ph2) {
-            try {
-              await fetch(
-                API + "/Phone/" + phonePathSeg(ph2) + "?sheet=Registrations",
-                {
-                  method: "PATCH",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    data: {
-                      SpeakingTime: sheetTime(newSpeak2),
-                      MainTime: sheetTime(toHHMM(start)),
-                    },
-                  }),
-                },
-              );
-            } catch (e2) {}
-          }
-        }
-      }
-    }
-  } catch (e) {}
-}
 
 // --- Helpers ---
 function readFormFromDOM() {
@@ -779,6 +845,10 @@ function scr(s) {
 // Append " (est.)" so Google Sheets treats the value as plain text, not a time decimal
 function sheetTime(t) {
   return t ? t + " (est.)" : "";
+}
+// Times come back from the sheet with the " (est.)" marker; the UI adds its own.
+function plainTime(t) {
+  return String(t || "").replace(/\s*\(est\.\)\s*$/i, "").trim();
 }
 // encodeURIComponent encodes '+' as '%2B' — SheetDB URL-path matching won't decode that,
 // so phone lookups silently find nothing. Keep '+' as a literal in path segments.
@@ -857,6 +927,77 @@ function renderProgressBar(activeStep) {
 }
 
 // --- Render functions ---
+function cycleNoticeDismissed() {
+  try {
+    return sessionStorage.getItem("cycleNoticeDismissed") === currentCycleId();
+  } catch (e) {
+    return false;
+  }
+}
+function dismissCycleNotice() {
+  try {
+    sessionStorage.setItem("cycleNoticeDismissed", currentCycleId() || "1");
+  } catch (e) {}
+  staleReg = null;
+  step = 3;
+  render();
+}
+function adoptStaleRegistration() {
+  var reg = staleReg || getRegistration();
+  if (reg) {
+    form.name = reg.name || "";
+    form.phone = (reg.phone || "").replace(/^\+?998/, "");
+    form.school = reg.school || form.school;
+  }
+  form.slot = null;
+  form.speak = null;
+  staleReg = null;
+  step = registrationMode === "regular" ? 2 : 1;
+  render();
+}
+function renderCycleNotice() {
+  var reg = staleReg || getRegistration();
+  var oldDate = "";
+  var oldLabel = reg && reg.slotLabel ? esc(plainTime(reg.slotLabel)) : "";
+  if (reg && reg.cycleId) {
+    var parts = String(reg.cycleId).match(/(\d{4})-(\d{2})-(\d{2})/);
+    if (parts) {
+      oldDate = new Date(parts[1] + "-" + parts[2] + "-" + parts[3] + "T12:00:00Z").toLocaleDateString("en-GB", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+        timeZone: "UTC",
+      });
+    }
+  }
+  return (
+    '<div class="cycle-panel">' +
+      '<div class="cycle-panel-eyebrow">New test cycle</div>' +
+      '<h2 class="cycle-panel-title">A new test has opened.</h2>' +
+      '<p class="cycle-panel-body">' +
+        (oldDate
+          ? "Your registration was for the " + esc(oldDate) + " test. "
+          : "Your saved registration belongs to an earlier test. ") +
+        "Your name and phone carry over — choose a seat for <strong>" +
+        esc(formatTestDate(testDate)) + "</strong> and you are registered again." +
+      "</p>" +
+      (reg
+        ? '<dl class="cycle-facts">' +
+            '<div><dt>Name</dt><dd>' + esc(reg.name || "—") + "</dd></div>" +
+            '<div><dt>Phone</dt><dd>+998 ' + esc((reg.phone || "").replace(/^\+?998/, "")) + "</dd></div>" +
+            '<div><dt>School</dt><dd>' + esc(reg.school || "—") + "</dd></div>" +
+            (oldLabel ? '<div><dt>Previous seat</dt><dd>' + oldLabel + " (retired)</dd></div>" : "") +
+          "</dl>"
+        : "") +
+      '<div class="cycle-actions">' +
+        '<button type="button" class="btn-primary" onclick="adoptStaleRegistration()">Register for the new test</button>' +
+        '<button type="button" class="btn-secondary" onclick="dismissCycleNotice()">Keep my old details for now</button>' +
+      "</div>" +
+      '<p class="cycle-note">Nothing is deleted. If you do not register, your saved details stay on this device.</p>' +
+    "</div>"
+  );
+}
+
 function renderStep1() {
   // Deadline enforcement
   if (isRegistrationClosed()) {
@@ -931,7 +1072,7 @@ function renderStep1() {
       badgeText = "Almost full";
     }
     
-    var badgeHtml = '<span class="' + badgeClass + '">' + badgeText + '</span>';
+    var badgeHtml = badgeText ? '<span class="' + badgeClass + '">' + badgeText + '</span>' : "";
     var typeBadgeHtml = '<span class="' + typeBadgeClass + '">' + typeBadgeText + '</span>';
     
     // Count html text
@@ -1041,6 +1182,10 @@ function renderSpeakingGrid() {
   }).join("");
 
   var canNext = !!form.speak;
+  var anyOpen = choosableGrid.some(function (g) {
+    var rem = seats[g.poolId] !== undefined ? Number(seats[g.poolId]) : g.capacity;
+    return rem > 0 && g.capacity > 0;
+  });
   var progressHtml = renderProgressBar(6);
   var summary =
     '<div class="selected-slot-recap"><div>' +
@@ -1061,7 +1206,10 @@ function renderSpeakingGrid() {
     '<div class="section-label">Choose your speaking time</div>' +
     hint +
     '<div class="speak-grid">' + cells + '</div>' +
-    '<button class="btn-primary" onclick="goSpeakNext()" ' + (canNext ? "" : "disabled") + '>Continue to details</button>' +
+    (anyOpen
+      ? ""
+      : '<div class="err-banner" role="status" style="margin-top:12px">No speaking times are left for this session. Go back and choose another session, or ask the desk to add an assessor.</div>') +
+    '<button class="btn-primary" onclick="goSpeakNext()" ' + (canNext ? "" : "disabled") + '>Continue</button>' +
     '<button class="btn-secondary" onclick="goBackToStep1()">Back</button>'
   );
 }
@@ -1136,7 +1284,7 @@ function renderExamType() {
     "</div>" +
     '<button class="btn-primary" onclick="goToDetails()" ' +
     (canCont ? "" : "disabled") +
-    ">Continue to details</button>" +
+    ">Continue</button>" +
     '<button class="btn-secondary" onclick="goBackToStep1()">Back</button>'
   );
 }
@@ -1204,7 +1352,7 @@ function renderStep2() {
       (errors.school ? '<div class="error-msg" id="err-school">' + errors.school + "</div>" : "") +
       "</div>" +
       '<button class="btn-primary" onclick="submitForm()" ' + (submitting ? "disabled" : "") + ">" +
-      (submitting ? "Registering…" : "Complete registration") +
+      (submitting ? "Reserving…" : "Reserve my seat") +
       "</button>"
     );
   }
@@ -1247,8 +1395,7 @@ function renderStep2() {
     '<div style="font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:3px">Selected session</div>' +
     '<div class="recap-time">' +
     slotInfo.label +
-    " \u2014 " +
-    slotInfo.period +
+    (slotInfo.period ? " \u2014 " + slotInfo.period : "") +
     schedPill +
     "</div></div>" +
     '<span class="recap-change" onclick="goBack()">Change</span></div>' +
@@ -1295,7 +1442,7 @@ function renderStep2() {
     '<button class="btn-primary" onclick="submitForm()" ' +
     (submitting ? "disabled" : "") +
     ">" +
-    (submitting ? "Registering\u2026" : "Complete registration") +
+    (submitting ? "Reserving\u2026" : "Reserve my seat") +
     "</button>" +
     '<button class="btn-secondary" onclick="goBack()">Back</button>'
   );
@@ -1307,6 +1454,9 @@ function renderManage() {
     step = 1;
     return renderStep1();
   }
+  var slotLabel = plainTime(reg.slotLabel);
+  var speakTime = plainTime(reg.speakTime);
+  var mainTime = plainTime(reg.mainTime);
   var tgPhone = (reg.phone || '').replace(/\D/g, '');
   var tgLink = 'https://t.me/ajmockbot?start=998' + tgPhone;
   return (
@@ -1323,7 +1473,7 @@ function renderManage() {
     esc(reg.name) +
     "</span></div>" +
     '<div class="booking-row"><span class="booking-row-label">Session</span><span class="booking-row-val">' +
-    esc(reg.slotLabel) +
+    esc(slotLabel) +
     "</span></div>" +
     (reg.examType
       ? '<div class="booking-row"><span class="booking-row-label">Exam type</span><span class="booking-row-val" style="color:' +
@@ -1334,14 +1484,14 @@ function renderManage() {
       : "") +
     (reg.speakTime
       ? '<div class="booking-row"><span class="booking-row-label">Speaking time</span><span class="booking-row-val" style="color:var(--speak)">' +
-        esc(reg.speakTime) +
+        esc(speakTime) +
         ' <span style="font-weight:400;font-size:12px;color:var(--muted)">(est.)</span></span></div>'
       : "") +
     (reg.mainTime
       ? '<div class="booking-row"><span class="booking-row-label">' +
         (reg.examType === "speaking" ? "Main exam" : "Main exam") +
         ' time</span><span class="booking-row-val" style="color:var(--main)">' +
-        esc(reg.mainTime) +
+        esc(mainTime) +
         ' <span style="font-weight:400;font-size:12px;color:var(--muted)">(est.)</span></span></div>'
       : "") +
     '<div class="booking-row"><span class="booking-row-label">Phone</span><span class="booking-row-val">+998 ' +
@@ -1359,13 +1509,13 @@ function renderManage() {
         '</span></div>'
       : "") +
     "</div>" +
-    '<div id="tg-reminder-card" style="display:flex;align-items:center;gap:12px;background:rgba(36,161,222,0.1);border:1px solid rgba(36,161,222,0.2);border-radius:12px;padding:14px 16px;margin:16px 0">' +
-    '<div style="font-size:22px;flex-shrink:0">&#128172;</div>' +
-    '<div style="flex:1">' +
-    '<div style="font-size:14px;font-weight:600;color:#24a1de">Get Telegram Reminders</div>' +
-    '<div style="font-size:12px;color:var(--muted);margin-top:3px">We&#39;ll message you the evening before your test</div>' +
+    '<div class="tg-card">' +
+    '<div class="tg-card-icon" aria-hidden="true">&#128172;</div>' +
+    '<div class="tg-card-copy">' +
+    '<div class="tg-card-title">Get Telegram reminders</div>' +
+    '<div class="tg-card-sub">We&#39;ll message you the evening before your test</div>' +
     '</div>' +
-    '<a href="' + tgLink + '" target="_blank" rel="noopener" style="display:inline-block;background:#24a1de;color:#fff;font-size:13px;font-weight:600;padding:8px 16px;border-radius:8px;text-decoration:none;white-space:nowrap">Open Bot</a>' +
+    '<a class="tg-card-link" href="' + tgLink + '" target="_blank" rel="noopener">Open bot</a>' +
     '</div>' +
     (reg.regular || !reg.speakTime
       ? ""
@@ -1581,7 +1731,7 @@ function renderChangeSlot() {
       badgeText = "Almost full";
     }
     
-    var badgeHtml = '<span class="' + badgeClass + '">' + badgeText + '</span>';
+    var badgeHtml = badgeText ? '<span class="' + badgeClass + '">' + badgeText + '</span>' : "";
 
     // Count html text
     var countHtml = isMine
@@ -1640,14 +1790,17 @@ function renderChangeSlot() {
 }
 
 function render() {
+  var targetHash = step === 99 ? "#/admin" : "#step" + step;
   // Push state to history so mobile back button works properly
   if (!history.state || history.state.step !== step) {
-    history.pushState({ step: step }, "", "#step" + step);
+    history.pushState({ step: step }, "", targetHash);
+  } else if (location.hash !== targetHash) {
+    history.replaceState({ step: step }, "", targetHash);
   }
 
   var appEl = document.getElementById("app");
   if (appEl) {
-    if (step === 99 && adminAuthenticated) {
+    if (step === 99) {
       appEl.classList.add("admin-mode");
     } else {
       appEl.classList.remove("admin-mode");
@@ -1658,11 +1811,15 @@ function render() {
   var subEl = document.getElementById("header-subtitle");
   if (subEl) {
     subEl.textContent = registrationMode === "regular"
-      ? "Enter your details below to register"
-      : "Select a session and complete your details below";
+      ? "Enter your details below and we will confirm your seat by phone."
+      : "Pick a session, choose your speaking time, and confirm your details. It takes about two minutes.";
   }
 
   var el = document.getElementById("main");
+  var eyebrowEl = document.querySelector(".header-eyebrow");
+  if (eyebrowEl) {
+    eyebrowEl.textContent = step === 99 ? "Operations" : "Candidate registration";
+  }
   var html = "";
   if (step === 1) {
     html = renderStep1();
@@ -1677,10 +1834,11 @@ function render() {
   } else if (step === 3) html = renderManage();
   else if (step === 4) html = renderChangeSlot();
   else if (step === 7) html = renderChangeSpeak();
+  else if (step === 10) html = renderCycleNotice();
   else if (step === 99) {
     html = adminAuthenticated
-      ? renderAdminPanelHTML()
-      : renderAdminLoginHTML();
+      ? renderAdminChrome(renderAdminPanelHTML())
+      : '<div class="admin-login-wrap">' + renderAdminLoginHTML() + "</div>";
   } else {
     step = 1;
     html = renderStep1();
@@ -1707,8 +1865,60 @@ function render() {
     }, 50);
   }
 
+  updateCycleStatus();
+  saveDraft();
+
   // Admin FAB: show on non-admin screens when authenticated
   updateAdminFab();
+}
+
+// Signature element: which test cycle am I part of, and until when.
+function updateCycleStatus() {
+  var el = document.getElementById("cycle-status");
+  if (!el) return;
+  if (step === 99) {
+    el.innerHTML = "";
+    return;
+  }
+  var reg = getRegistration();
+  var cls = "cycle-status";
+  var text = "";
+  if (reg && isStaleRegistration(reg)) {
+    cls += " cs-warn";
+    text =
+      "A new test cycle is open for <strong>" + esc(formatTestDate(testDate)) +
+      "</strong>. Your saved details carry over — choose a seat for this test.";
+  } else if (reg) {
+    text =
+      "Seat reserved for <strong>" + esc(formatTestDate(testDate)) + "</strong>" +
+      (reg.slotLabel ? " · " + esc(plainTime(reg.slotLabel)) : "") +
+      ' · <a href="#step3" onclick="return goManage(event)">Manage booking</a>';
+  } else if (isRegistrationClosed()) {
+    cls += " cs-off";
+    text = "Registration is closed for the current test. Keep this page for the next cycle.";
+  } else {
+    var closeIn = deadline ? deadline.getTime() - Date.now() : null;
+    text = deadline
+      ? "Registration open · closes <strong>" + esc(formatDeadline(deadline)) + "</strong>"
+      : "Registration open · test date <strong>" + esc(formatTestDate(testDate)) + "</strong>";
+    if (closeIn !== null && closeIn > 0 && closeIn < 48 * 60 * 60 * 1000) {
+      cls += " cs-warn";
+    }
+    if (reg === null && step !== 10) {
+      text += " · takes about two minutes";
+    }
+  }
+  el.className = cls;
+  el.innerHTML =
+    '<span class="cs-dot" aria-hidden="true"></span>' +
+    '<span class="cs-label">Test cycle</span>' +
+    '<span class="cs-text">' + text + "</span>";
+}
+function goManage(ev) {
+  if (ev) ev.preventDefault();
+  step = getRegistration() ? 3 : 1;
+  render();
+  return false;
 }
 
 function updateAdminFab() {
@@ -1719,7 +1929,7 @@ function updateAdminFab() {
       fab.id = "admin-fab";
       fab.className = "admin-fab";
       fab.innerHTML = '&#9881; Admin';
-      fab.onclick = function () { step = 99; render(); };
+      fab.onclick = enterAdmin;
       document.body.appendChild(fab);
     }
   } else if (existing) {
@@ -2061,16 +2271,19 @@ async function submitForm() {
         candidateNumber: (rResp && rResp.candidateNumber) || rPayload.CandidateNumber,
       };
       saveRegistration(rReg);
+      renewalAttempted = false;
       submitting = false;
       step = 3;
       render();
     } catch (err) {
       submitting = false;
       var rb = document.querySelector(".btn-primary");
-      if (rb) { rb.disabled = false; rb.innerHTML = "Complete registration"; }
+      if (rb) { rb.disabled = false; rb.innerHTML = "Reserve my seat"; }
       if (err.message === "DUPLICATE_PHONE") {
-        errors.phone = "A user with this phone number is already registered.";
+        if (await tryAutoRenewal()) return;
+        errors.phone = "";
         render();
+        offerRenewal();
       } else {
         alert("Submission failed: " + err.message);
       }
@@ -2147,6 +2360,8 @@ async function submitForm() {
       regData.mainTime = slotInfo.label;
     }
     saveRegistration(regData);
+    renewalAttempted = false;
+    clearDraft();
     await loadSessionConfig(); // Refresh authoritative seats map
     submitting = false;
     step = 3;
@@ -2156,12 +2371,14 @@ async function submitForm() {
     var freshBtn = document.querySelector(".btn-primary");
     if (freshBtn) {
       freshBtn.disabled = false;
-      freshBtn.innerHTML = "Complete registration";
+      freshBtn.innerHTML = "Reserve my seat";
     }
 
     if (err.message === "DUPLICATE_PHONE") {
-      errors.phone = "A user with this phone number is already registered.";
+      if (await tryAutoRenewal()) return;
+      errors.phone = "";
       render();
+      offerRenewal();
     } else if (err.message === "SESSION_FULL") {
       alert("Sorry, this main session just filled up. Please choose another session.");
       await loadSessionConfig();
@@ -2226,7 +2443,10 @@ async function performCancellationLogic(reg) {
         API + "/Phone/" + phonePathSeg(cancelPhone) + "?sheet=Registrations&confirm=1",
         {
           method: "DELETE",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "X-Admin-Hash": sessionStorage.getItem("adminAuthHash") || ADMIN_HASH,
+          },
         },
       );
       try {
@@ -2265,6 +2485,7 @@ async function cancelRegistration() {
   try {
     await performCancellationLogic(reg);
     clearRegistration();
+    clearDraft();
     form = { slot: null, speak: null, name: "", phone: "", school: "" };
     examType = null;
     // Regular mode has no step 1 — bounce to the details form so the student
@@ -2633,7 +2854,9 @@ async function syncSeatsSheet(sessions) {
   // corrected on the next admin save.
   var regs = [];
   try {
-    var rRes = await fetch(API + "?sheet=Registrations");
+    var rRes = await fetch(API + "?sheet=Registrations", {
+      headers: { "X-Admin-Hash": sessionStorage.getItem("adminAuthHash") || ADMIN_HASH },
+    });
     if (rRes.ok) {
       var rParsed = await rRes.json();
       if (Array.isArray(rParsed)) regs = rParsed;
@@ -2867,15 +3090,114 @@ function toLocalDatetimeString(d) {
   );
 }
 
+function enterAdmin() {
+  adminStatus = "";
+  step = 99;
+  render();
+}
+function routeFromHash() {
+  var hash = location.hash || "";
+  if (hash === "#/admin") {
+    if (step !== 99) {
+      step = 99;
+      adminStatus = "";
+      render();
+    }
+    return;
+  }
+  var m = /^#step(\d+)$/.exec(hash);
+  if (!m) return;
+  var n = parseInt(m[1], 10);
+  if (n === 99) {
+    if (!adminAuthenticated) {
+      step = homeStep();
+      render();
+    }
+    return;
+  }
+  if (n !== step) {
+    step = n;
+    render();
+  }
+}
+try {
+  window.addEventListener("hashchange", routeFromHash);
+  window.addEventListener("popstate", routeFromHash);
+} catch (e) {}
+
+// --- Admin console chrome ---
+var ADMIN_TABS = [
+  ["deadline", "Deadline"],
+  ["sessions", "Sessions"],
+  ["mode", "Mode"],
+  ["students", "Students"],
+  ["results", "Results"],
+  ["bot", "Bot"],
+];
+function renderAdminChrome(panelHtml) {
+  var remaining = 0;
+  var configured = 0;
+  for (var i = 0; i < SLOTS.length; i++) {
+    var sid = SLOTS[i].id;
+    if (seats[sid] !== undefined) {
+      remaining += Number(seats[sid]) || 0;
+      configured++;
+    }
+  }
+  var totalReg = adminStudents ? adminStudents.length : null;
+  var nav = '<nav class="admin-nav" aria-label="Admin sections">';
+  for (var t = 0; t < ADMIN_TABS.length; t++) {
+    var key = ADMIN_TABS[t][0];
+    var isCurrent = adminActiveTab === key;
+    nav +=
+      '<button type="button" onclick="adminSwitchTab(\'' + key + '\')"' +
+      (isCurrent ? ' aria-current="page"' : "") +
+      ' aria-label="' + ADMIN_TABS[t][1] + '"' +
+      ">" + ADMIN_TABS[t][1] +
+      (key === "students" && totalReg !== null
+        ? ' <span class="admin-tab-badge" aria-hidden="true">' + totalReg + "</span>"
+        : "") +
+      "</button>";
+  }
+  nav += "</nav>";
+
+  return (
+    '<div class="admin-page">' +
+      '<div class="admin-head">' +
+        '<div>' +
+          '<div class="admin-eyebrow">Operations</div>' +
+          '<h1 class="admin-page-title">Admin console</h1>' +
+          '<div class="admin-page-sub">Deadline, sessions, roster, results and the reminder bot in one place.</div>' +
+        "</div>" +
+        '<div class="admin-head-actions">' +
+          '<button type="button" class="btn-secondary" onclick="closeAdmin()">Back to registration</button>' +
+          '<button type="button" class="btn-danger" onclick="adminLogout()">Log out</button>' +
+        "</div>" +
+      "</div>" +
+      '<div class="admin-stats">' +
+        '<div class="admin-stat"><div class="admin-stat-label">Registrations</div><div class="admin-stat-value">' +
+          (totalReg !== null ? totalReg : "—") + "</div></div>" +
+        '<div class="admin-stat"><div class="admin-stat-label">Seats left</div><div class="admin-stat-value">' +
+          (configured ? remaining : "—") + "</div></div>" +
+        '<div class="admin-stat"><div class="admin-stat-label">Registration closes</div><div class="admin-stat-value small">' +
+          esc(formatDeadline(deadline)) + "</div></div>" +
+        '<div class="admin-stat"><div class="admin-stat-label">Test date</div><div class="admin-stat-value small">' +
+          esc(formatTestDate(testDate)) + "</div></div>" +
+      "</div>" +
+      '<div class="admin-body">' + nav +
+        '<div class="admin-content">' + panelHtml + "</div>" +
+      "</div>" +
+    "</div>"
+  );
+}
+
 // --- Admin panel ---
 function onHeaderClick() {
   headerClickCount++;
   if (headerClickTimer) clearTimeout(headerClickTimer);
   if (headerClickCount >= 5) {
     headerClickCount = 0;
-    adminStatus = "";
-    step = 99;
-    render();
+    enterAdmin();
     return;
   }
   headerClickTimer = setTimeout(function () {
@@ -2915,7 +3237,10 @@ async function adminLogin() {
     adminFailedAttempts = 0;
     adminLockedUntil = 0;
     adminStatus = "";
-    try { sessionStorage.setItem("adminAuth", "1"); } catch (e) {}
+    try {
+      sessionStorage.setItem("adminAuth", "1");
+      sessionStorage.setItem("adminAuthHash", hash);
+    } catch (e) {}
     render();
   } else {
     adminFailedAttempts++;
@@ -2964,7 +3289,10 @@ function closeAdmin() {
 
 function adminLogout() {
   adminAuthenticated = false;
-  try { sessionStorage.removeItem("adminAuth"); } catch (e) {}
+  try {
+    sessionStorage.removeItem("adminAuth");
+    sessionStorage.removeItem("adminAuthHash");
+  } catch (e) {}
   adminStatus = "";
   adminSessionDraft = null;
   step = homeStep();
@@ -2975,11 +3303,12 @@ function adminLogout() {
 function renderAdminLoginHTML() {
   return (
     '<div class="admin-panel">' +
-    '<div class="admin-title">Admin access</div>' +
-    '<div class="admin-sub">Enter your password to manage the registration deadline.</div>' +
-    '<input id="admin-pw-input" class="admin-input" type="password" placeholder="Password" />' +
+    '<div class="admin-eyebrow">Operations</div>' +
+    '<div class="admin-title">Admin console</div>' +
+    '<div class="admin-sub">Sign in to manage the deadline, sessions, roster and reminder bot.</div>' +
+    '<input id="admin-pw-input" class="admin-input" type="password" placeholder="Password" aria-label="Admin password" autocomplete="current-password" />' +
     '<button class="btn-primary" style="margin-top:0" onclick="adminLogin()">Unlock</button>' +
-    '<div id="admin-status" class="admin-status err">' +
+    '<div id="admin-status" class="admin-status err" role="alert">' +
     (adminStatus || "") +
     "</div>" +
     '<button class="btn-secondary" onclick="closeAdmin()">Cancel</button>' +
@@ -3001,7 +3330,9 @@ async function adminLoadStudents(force) {
   adminStudentsError = "";
   render();
   try {
-    var res = await fetch(API + "?sheet=Registrations");
+    var res = await fetch(API + "?sheet=Registrations", {
+      headers: { "X-Admin-Hash": sessionStorage.getItem("adminAuthHash") || ADMIN_HASH },
+    });
     if (!res.ok) throw new Error("Failed to load " + res.status);
     var data = await res.json();
     adminStudents = Array.isArray(data) ? data.slice().reverse() : []; // show newest first
@@ -3072,7 +3403,7 @@ function renderAdminPanelHTML() {
 
   if (adminActiveTab === "students") {
     var html =
-      '<div class="admin-panel" style="max-width:600px"><div class="admin-title">Students Roster</div>' +
+      '<div class="admin-panel" style="max-width:600px"><div class="admin-title">Candidate roster</div>' +
       tabs;
 
     // Search input
@@ -3100,7 +3431,7 @@ function renderAdminPanelHTML() {
         });
       }
       if (filteredStudents.length === 0) {
-        html += '<div style="text-align:center;color:var(--muted);font-size:13px;padding:2rem 0">No students match &ldquo;' + esc(adminStudentFilter) + '&rdquo;</div>';
+        html += '<div style="text-align:center;color:var(--muted);font-size:13px;padding:2rem 0">No candidates match &ldquo;' + esc(adminStudentFilter) + '&rdquo;</div>';
       } else {
       var rosterParams = filteredStudents
         .map(function (st) {
@@ -3128,7 +3459,7 @@ function renderAdminPanelHTML() {
           return (
             '<div class="session-row" style="padding:12px;justify-content:space-between;align-items:center">' +
             '<div><div style="font-size:14px;font-weight:600;color:var(--text);margin-bottom:4px">' +
-            esc(nm) + ' <span style="font-size:12px;color:var(--accent);font-weight:400">(ID: ' + esc(st.CandidateNumber || st.candidatenumber || "N/A") + ')</span>' +
+            esc(nm) + ' <span style="font-size:12px;color:var(--accent);font-weight:400">(Candidate ' + esc(st.CandidateNumber || st.candidatenumber || "N/A") + ')</span>' +
             "</div>" +
             '<div style="font-size:12px;color:var(--muted)">' +
             esc(ph) +
@@ -3157,7 +3488,7 @@ function renderAdminPanelHTML() {
     } // close filteredStudents.length > 0
     } else {
       html +=
-        '<div style="text-align:center;color:var(--muted);font-size:13px;padding:2rem 0">No students registered yet.</div>';
+        '<div style="text-align:center;color:var(--muted);font-size:13px;padding:2rem 0">No candidates registered yet.</div>';
     }
 
     html +=
@@ -3504,7 +3835,9 @@ async function adminLoadResults() {
   adminResultsLoading = true;
   render();
   try {
-    var res = await fetch("/api?sheet=Results");
+    var res = await fetch("/api?sheet=Results", {
+      headers: { "X-Admin-Hash": sessionStorage.getItem("adminAuthHash") || ADMIN_HASH },
+    });
     if (res.ok) {
       adminResultsList = await res.json();
     } else {
@@ -3522,7 +3855,7 @@ async function adminSendResultsNotifications() {
   adminResultsStatus = "Sending notifications to candidates via Telegram...";
   render();
   try {
-    var adminHash = sessionStorage.getItem("adminAuthHash") || EXPECTED_ADMIN_HASH;
+    var adminHash = sessionStorage.getItem("adminAuthHash") || ADMIN_HASH;
     var res = await fetch("/api/admin/send-results-notifications", {
       method: "POST",
       headers: {
@@ -4052,6 +4385,10 @@ window.addEventListener("popstate", function(e) {
     // so Back doesn't show the CDI session list in Regular mode.
     if (step === 1 && registrationMode === "regular") step = homeStep();
     render();
+  } else if (location.hash === "#/admin" || /^#step\d+$/.test(location.hash)) {
+    // Entry without our history state (initial load of a deep link): honour the
+    // hash instead of dropping the visitor on the home screen.
+    routeFromHash();
   } else {
     // If no state (loaded root), route to the mode-appropriate home.
     step = homeStep();
