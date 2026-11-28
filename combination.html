@@ -92,30 +92,40 @@
             padding: 40px 40px 30px;
             position: relative;
             text-align: left;
+            /* Title and subtitle share the left column; the Reset Progress
+               button owns the right column, so nothing runs under it. */
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            grid-template-areas:
+                "title reset"
+                "subtitle reset";
+            align-items: start;
+            column-gap: 24px;
+            row-gap: 8px;
         }
 
         .header h1 {
+            grid-area: title;
             font-size: 2em;
             font-weight: 700;
-            /* Hug the text and stay centred so the heading never runs under
-               the Reset Progress button in the corner. */
-            width: fit-content;
-            max-width: 100%;
-            margin: 0 auto 8px;
+            margin: 0;
             letter-spacing: -0.025em;
         }
 
         .header p {
+            grid-area: subtitle;
             color: #94a3b8;
             /* Slate 400 */
             font-size: 1.05em;
             max-width: 600px;
+            margin: 0;
         }
 
         .reset-button {
-            position: absolute;
-            top: 40px;
-            right: 40px;
+            grid-area: reset;
+            justify-self: end;
+            align-self: start;
+            position: static;
             background: rgba(255, 255, 255, 0.1);
             color: white;
             border: 1px solid rgba(255, 255, 255, 0.2);
@@ -213,6 +223,9 @@
             color: var(--primary-light);
             cursor: not-allowed;
             box-shadow: none;
+            /* No colour fade here: buttons are locked as the page loads, and
+               fading leaves them unreadable for a moment. */
+            transition: none;
         }
 
         /* Completed State */
@@ -360,7 +373,7 @@
         /* While a dialog is open it is the only thing on screen: the page
            behind it is taken out of the layout instead of showing through. */
         body:has(.modal[style*="display: block"])>.container {
-            visibility: hidden;
+            display: none;
         }
 
         .modal-content {
